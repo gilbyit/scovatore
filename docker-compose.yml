@@ -1,0 +1,24 @@
+services:
+  scovatore:
+    build: .
+    container_name: scovatore
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # dentro il container i percorsi sono fissi, qualunque cosa dica il .env
+      SCOVATORE_DATA_DIR: /app/data
+      SCOVATORE_HUNTS_DIR: /app/cacce
+      SCOVATORE_DB: /app/data/scovatore.db
+    volumes:
+      - ./cacce:/app/cacce:ro
+      - ./dati:/app/dati:ro
+      - ./data:/app/data
+    networks:
+      - palantir
+
+# Rete del compose di Palantir, per raggiungere il gateway per nome.
+# Verifica il nome reale con: docker network ls
+networks:
+  palantir:
+    external: true
+    name: palantir_default
