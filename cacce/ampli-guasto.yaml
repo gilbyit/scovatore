@@ -1,0 +1,40 @@
+# Caccia: amplificatore audio guasto di buona marca, con guasto probabile in alimentazione.
+
+nome: ampli-guasto
+attiva: true
+ogni_minuti: 240
+
+ebay:
+  marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR]
+  valuta: EUR
+  prezzo_max: 150               # da regolare
+  spedizione_inclusa: true
+  regione: EUROPEAN_UNION
+  consegna_paese: IT
+  condizioni: [guasto]          # conditionId 7000: "per ricambi o non funzionante"
+  ordinamento: newlyListed
+  max_risultati_per_query: 100
+
+ricerca: >
+  Amplificatore audio hi-fi (integrato, finale o ricevitore stereo) guasto o non funzionante,
+  venduto per ricambi o da riparare.
+
+# Attenzione: sono parole che, da sole nel titolo, indicano l'oggetto sbagliato.
+# "telecomando" da solo escluderebbe anche "amplificatore con telecomando".
+parole_escluse: [solo telecomando, only remote, nur fernbedienung, service manual, schaltplan, schema elettrico]
+
+screening: true
+
+requisiti_avanzati: |
+  - Marca e modello di buona reputazione e qualita' costruttiva (hi-fi di fascia media o alta,
+    non prodotti economici da supermercato o mini impianti).
+  - I sintomi dichiarati devono far pensare a un guasto di alimentazione e NON allo stadio finale.
+    Euristiche da applicare:
+    * non si accende, nessun LED, fusibile integro: probabile alimentazione o standby. Favorevole.
+    * ronzio forte, alimentazione instabile, si spegne da solo: probabili condensatori di filtro. Favorevole.
+    * brucia il fusibile appena acceso: spesso finali in corto. Sfavorevole anche se sembra alimentazione.
+    * rele' che non scatta o va in protezione: ambiguo (DC offset dai finali oppure un ramo di alimentazione mancante). Incerto.
+    * un solo canale funziona, distorsione su un canale, fumo dai dissipatori: stadio finale. Sfavorevole.
+    * "non testato", "venduto come guasto" senza sintomi: sconosciuto. Incerto, non scartare.
+  - Riporta la probabilita' che il guasto sia di alimentazione (alta / media / bassa) nel campo valore del requisito.
+  - Segnala parti mancanti (coperchio, manopole, trasformatore) e segni di interventi precedenti.

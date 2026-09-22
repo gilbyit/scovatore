@@ -1,0 +1,2 @@
+modello,socket,canali_ram,tipo_ram,tdp_w,avx2,passmark_single,passmark_multi,fonte
+# Compilare con valori verificati su cpubenchmark.net. Una riga per CPU. Righe con # sono ignorate da chi legge ma arrivano comunque al modello come testo.

@@ -1,0 +1,288 @@
+import json
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import pytest
+
+from scovatore import prompts
+from scovatore.config import load_config
+from scovatore.db import DB
+from scovatore.ebay import EbayClient, build_filter, html_to_text
+from scovatore.hunt import HuntError, load_all, parse_hunt
+from scovatore.llm import LLMClient, TokenBucket, extract_json
+from scovatore.pipeline import local_reject_reason, normalize_plan, run_hunt
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------- helpers
+def summary(item_id, title, price, ship=5.0, currency="EUR", country="DE", fb="99.5"):
+    d = {"itemId": f"v1|{item_id}|0", "legacyItemId": str(item_id), "title": title,
+         "itemWebUrl": f"https://www.ebay.it/itm/{item_id}",
+         "price": {"value": str(price), "currency": currency},
+         "condition": "Usato", "conditionId": "3000", "buyingOptions": ["FIXED_PRICE"],
+         "itemLocation": {"country": country},
+         "seller": {"username": "tizio", "feedbackPercentage": fb, "feedbackScore": 500}}
+    if ship is not None:
+        d["shippingOptions"] = [{"shippingCost": {"value": str(ship), "currency": currency}}]
+    return d
+
+
+CATALOG = [
+    summary(1, "Asus P9X79 + Xeon E5-1650 v2 + 16GB", 80),
+    summary(2, "Gigabyte X79 UD3 con i7-4820K", 60, ship=12),
+    summary(3, "Mainboard X79 solo cpu cooler", 20),         # parola esclusa via piano
+    summary(4, "Asus X79 Deluxe con i7-3930K", 99, ship=10),  # oltre budget con spedizione
+    summary(5, "Custodia per scheda madre", 10),              # la scrematura dice no
+    summary(6, "X79 board UK", 50, currency="GBP"),           # valuta sbagliata
+]
+
+
+class FakeEbay:
+    def __init__(self):
+        self.searches = []
+        self.details = 0
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/oauth2/token"):
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 7200})
+        assert req.headers["Authorization"] == "Bearer tok"
+        assert req.headers["X-EBAY-C-ENDUSERCTX"].startswith("contextualLocation=country%3DIT")
+        if req.url.path.endswith("/item_summary/search"):
+            q = parse_qs(urlparse(str(req.url)).query)
+            self.searches.append((req.headers["X-EBAY-C-MARKETPLACE-ID"], q["q"][0], q.get("filter", [""])[0]))
+            return httpx.Response(200, json={"total": len(CATALOG), "itemSummaries": CATALOG})
+        if "/item/" in req.url.path:
+            self.details += 1
+            return httpx.Response(200, json={
+                "description": "<p>Funzionante, <b>CPU inclusa</b></p><script>x()</script>",
+                "localizedAspects": [{"name": "Chipset", "value": "Intel X79"}],
+                "shippingOptions": [{"shippingCost": {"value": "5.00", "currency": "EUR"}}]})
+        return httpx.Response(404)
+
+
+class FakeLLM:
+    def __init__(self):
+        self.calls = {"plan": 0, "screen": 0, "verify": 0}
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        system = body["messages"][0]["content"]
+        user = body["messages"][1]["content"]
+        if system == prompts.PLAN_SYSTEM:
+            self.calls["plan"] += 1
+            content = json.dumps({"elementi_chiave": ["x79"],
+                                  "query": {"it": ["scheda madre x79 cpu", "scheda madre x79 cpu"],
+                                            "de": ["x79 mainboard cpu"], "en": ["x79 motherboard cpu"]},
+                                  "parole_escluse": ["cooler"], "requisiti_base": ["scheda madre con cpu"]})
+            content = "<think>ragiono</think>\n```json\n" + content + "\n```"
+        elif system == prompts.SCREEN_SYSTEM:
+            self.calls["screen"] += 1
+            rows = []
+            for line in user.splitlines():
+                if line.startswith("["):
+                    i = line[1:line.index("]")]
+                    rows.append({"id": i, "esito": "no" if "Custodia" in line else "si", "motivo": "t"})
+            content = json.dumps({"valutazioni": rows})
+        else:
+            self.calls["verify"] += 1
+            score = 85 if "1650" in user else 40
+            content = json.dumps({"oggetto": "bundle", "esito": "conforme" if score > 50 else "incerto",
+                                  "punteggio": score, "requisiti": [], "segnali_rischio": [],
+                                  "sintesi": "ok"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}],
+                                         "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
+
+
+HUNT = {
+    "nome": "Test Mobo",
+    "ricerca": "scheda madre DDR3 quad channel con cpu",
+    "requisiti_avanzati": "TDP < 100 W",
+    "ebay": {"marketplaces": ["EBAY_IT", "EBAY_DE"], "prezzo_max": 100, "condizioni": ["usato"]},
+}
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    for k in ("EBAY_APP_ID", "EBAY_CERT_ID", "GROQ_API_KEY", "PALANTIR_BASE_URL", "SCOVATORE_NTFY_URL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SCOVATORE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GROQ_TPM_LIMIT", "0")
+    return load_config(env_file=str(tmp_path / "nessuno.env"))
+
+
+def make_clients(cfg, ebay_fake, llm_fake):
+    ebay = EbayClient("app", "cert", cfg.ebay_api_base, "IT", "10100", 1000,
+                      transport=httpx.MockTransport(ebay_fake))
+    pal = LLMClient(cfg.palantir, transport=httpx.MockTransport(llm_fake))
+    groq = LLMClient(cfg.groq, transport=httpx.MockTransport(llm_fake))
+    return ebay, pal, groq
+
+
+# ---------------------------------------------------------------- unit
+def test_build_filter():
+    h = parse_hunt(HUNT)
+    f = build_filter(h.ebay)
+    assert "price:[..100]" in f and "priceCurrency:EUR" in f
+    assert "itemLocationRegion:EUROPEAN_UNION" in f
+    assert "deliveryCountry:IT" in f
+    assert "conditionIds:{3000|4000|5000|6000}" in f
+
+
+def test_filter_price_range_and_country():
+    h = parse_hunt({**HUNT, "ebay": {"prezzo_min": 10, "prezzo_max": 50.5, "regione": None, "paese": "de",
+                                     "formati": ["auction"], "escludi_venditori": ["a", "b"]}})
+    f = build_filter(h.ebay)
+    assert "price:[10..50.5]" in f and "itemLocationCountry:DE" in f
+    assert "buyingOptions:{AUCTION}" in f and "excludeSellers:{a|b}" in f
+
+
+def test_hunt_validation():
+    with pytest.raises(HuntError):
+        parse_hunt({"nome": "x"})
+    with pytest.raises(HuntError):
+        parse_hunt({**HUNT, "ebay": {"regione": "EUROPEAN_UNION", "paese": "IT"}})
+    with pytest.raises(HuntError):
+        parse_hunt({**HUNT, "ebay": {"condizioni": ["rotto-forte"]}})
+    with pytest.raises(HuntError):
+        parse_hunt({**HUNT, "ebay": {"prezo_max": 10}})
+    with pytest.raises(HuntError):
+        parse_hunt({**HUNT, "campo_sbagliato": 1})
+    assert parse_hunt(HUNT).nome == "test-mobo"
+    assert parse_hunt(HUNT).languages() == ["de", "en", "it"]
+
+
+def test_example_hunts_are_valid():
+    hunts = load_all(ROOT / "cacce")
+    assert {h.nome for h in hunts} == {"mobo-ddr3-quad", "ampli-guasto"}
+    amp = next(h for h in hunts if h.nome == "ampli-guasto")
+    assert amp.ebay.condizioni == [7000]
+
+
+def test_extract_json_variants():
+    assert extract_json('{"a": 1}') == {"a": 1}
+    assert extract_json('<think>bla {x}</think>\n```json\n{"a": 2}\n```') == {"a": 2}
+    assert extract_json('Ecco il risultato: {"a": 3} spero vada bene') == {"a": 3}
+
+
+def test_html_to_text():
+    assert html_to_text("<p>Ciao&nbsp;<b>mondo</b></p><script>alert(1)</script>") == "Ciao mondo"
+
+
+def test_normalize_plan_dedup_and_cap():
+    plan = normalize_plan({"query": {"it": ["A b", "a  B", "c", "d", "e"]}}, ["it", "en"], 3)
+    assert plan["query"] == {"it": ["A b", "c", "d"], "en": []}
+    assert normalize_plan({"query": ["x"]}, ["en"], 3)["query"] == {"en": ["x"]}
+
+
+def test_token_bucket_no_limit_is_instant():
+    TokenBucket(0).wait(10_000)
+
+
+def test_local_reject():
+    from scovatore.ebay import parse_summary
+    h = parse_hunt({**HUNT, "ebay": {**HUNT["ebay"], "feedback_minimo": 98}})
+    ok = parse_summary(summary(1, "X79 board", 80), "EBAY_IT", "q")
+    assert local_reject_reason(ok, h, []) is None
+    assert "budget" in local_reject_reason(parse_summary(summary(2, "b", 99, ship=10), "EBAY_IT", "q"), h, [])
+    assert "valuta" in local_reject_reason(parse_summary(summary(3, "b", 9, currency="GBP"), "EBAY_IT", "q"), h, [])
+    assert "esclusa" in local_reject_reason(parse_summary(summary(4, "X79 solo cpu", 9), "EBAY_IT", "q"), h, ["solo cpu"])
+    assert local_reject_reason(parse_summary(summary(5, "X79 cpucooler", 9), "EBAY_IT", "q"), h, ["cpu"]) is None
+    assert "feedback" in local_reject_reason(parse_summary(summary(6, "b", 9, fb="95.0"), "EBAY_IT", "q"), h, [])
+
+
+# ---------------------------------------------------------------- end to end
+def test_pipeline_end_to_end(env):
+    cfg = env
+    hunt = parse_hunt(HUNT)
+    db = DB(cfg.db_path)
+    ef, lf = FakeEbay(), FakeLLM()
+    ebay, pal, groq = make_clients(cfg, ef, lf)
+
+    s = run_hunt(hunt, cfg, db, ebay, pal, groq)
+
+    # query: IT (1 dopo dedup) + EN su EBAY_IT, DE + EN su EBAY_DE
+    assert s.query == 4
+    assert {mp for mp, _, _ in ef.searches} == {"EBAY_IT", "EBAY_DE"}
+    assert s.unici == 6
+    assert s.scartati_filtri == 3           # cooler, oltre budget, GBP
+    assert s.scremati == 3 and s.scremati_no == 1
+    assert s.verificati == 2 and s.conformi == 1
+    assert ef.details == 2
+    assert lf.calls == {"plan": 1, "screen": 1, "verify": 2}
+
+    top = db.results(hunt.nome)
+    assert top[0]["legacy_id"] == "1" and top[0]["score"] == 85
+
+    # secondo giro: piano in cache, niente riscrematura ne' riverifica
+    s2 = run_hunt(hunt, cfg, db, ebay, pal, groq)
+    assert s2.nuovi == 0 and s2.scremati == 0 and s2.verificati == 0
+    assert lf.calls == {"plan": 1, "screen": 1, "verify": 2}
+
+    # cambiano i requisiti: si riverifica, ma non si ripianifica ne' si riscrema
+    hunt2 = parse_hunt({**HUNT, "requisiti_avanzati": "TDP < 80 W"})
+    s3 = run_hunt(hunt2, cfg, db, ebay, pal, groq)
+    assert s3.verificati == 2 and lf.calls["plan"] == 1 and lf.calls["screen"] == 1
+    db.close()
+
+
+def test_pipeline_without_groq_and_screening(env):
+    cfg = env
+    hunt = parse_hunt({**HUNT, "screening": False})
+    db = DB(cfg.db_path)
+    ef, lf = FakeEbay(), FakeLLM()
+    ebay, pal, _ = make_clients(cfg, ef, lf)
+    s = run_hunt(hunt, cfg, db, ebay, pal, None)
+    assert s.scremati == 0 and s.verificati == 0
+    assert lf.calls["screen"] == 0 and lf.calls["verify"] == 0
+    rows = db.results(hunt.nome, include_unverified=True)
+    assert {r["screen_verdict"] for r in rows} == {"saltato"}
+    db.close()
+
+
+def test_llm_falls_back_when_json_mode_rejected(env):
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        seen.append("response_format" in body)
+        if "response_format" in body:
+            return httpx.Response(400, text="unsupported param response_format")
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+    c = LLMClient(env.palantir, transport=httpx.MockTransport(handler))
+    assert c.chat_json("s", "u") == {"ok": True}
+    assert seen == [True, False]
+
+
+def test_notify(env, monkeypatch):
+    from scovatore.notify import notify
+    env.ntfy_url = "https://ntfy.example/topic"
+    hunt = parse_hunt(HUNT)
+    db = DB(env.db_path)
+    ebay, pal, groq = make_clients(env, FakeEbay(), FakeLLM())
+    env_ntfy = env.ntfy_url
+    env.ntfy_url = ""
+    run_hunt(hunt, env, db, ebay, pal, groq)
+    env.ntfy_url = env_ntfy
+    posts = []
+
+    def handler(req):
+        posts.append(req)
+        return httpx.Response(200)
+
+    assert notify(hunt, db, env, transport=httpx.MockTransport(handler)) == 1
+    assert "title=" in str(posts[0].url)
+    assert notify(hunt, db, env, transport=httpx.MockTransport(handler)) == 0
+    db.close()
+
+
+def test_daily_ebay_budget_counts_previous_runs(env):
+    hunt = parse_hunt(HUNT)
+    db = DB(env.db_path)
+    ebay, pal, groq = make_clients(env, FakeEbay(), FakeLLM())
+    s = run_hunt(hunt, env, db, ebay, pal, groq)
+    assert s.chiamate_ebay > 0
+    assert db.ebay_calls_today() == s.chiamate_ebay
+    db.close()
