@@ -7,7 +7,8 @@ Cacciatore di annunci eBay per NASGUL. Gli descrivi a parole cosa cerchi, senza 
 3. scarta in locale quello che non rientra (budget con spedizione, valuta, parole escluse, feedback);
 4. fa scremare i titoli a **Palantir**, a blocchi (si / forse / no);
 5. manda i sopravvissuti, con descrizione e specifiche complete, a **Groq** per la verifica dei requisiti avanzati;
-6. salva tutto in SQLite, stila una classifica e, se configurato, notifica via **ntfy** i nuovi annunci sopra soglia.
+6. salva tutto in SQLite, stila una classifica e, se configurato, notifica via **ntfy** i nuovi annunci sopra soglia;
+7. mostra i risultati in una piccola **interfaccia web** (servizio `scovatore-web`, porta 8482).
 
 Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
 
@@ -110,6 +111,23 @@ python -m scovatore risultati ampli-guasto --tutti    # anche i non verificati
 
 `-v` attiva il log di debug (mostra anche il motivo di ogni scarto locale).
 
+### Interfaccia web
+
+Il compose avvia anche `scovatore-web`, che legge lo stesso database in sola lettura:
+
+- `http://nasgul:8482/`: riepilogo delle cacce (conformi, verificati, in attesa, ultimo giro ed eventuali errori);
+- `/caccia/<nome>`: classifica filtrabile per esito, punteggio minimo, paese, periodo, con ordinamento per punteggio, prezzo o novità. Ogni annuncio ha il dettaglio della verifica (requisiti, fonte del dato, rischi, domande al venditore) e il motivo della scrematura;
+- `/giri`: gli ultimi giri di tutte le cacce con durata di ogni fase, contatori ed errori;
+- `/api/caccia/<nome>` e `/api/giri`: gli stessi dati in JSON (accettano gli stessi parametri della pagina), utili per GILPA.
+
+Senza `SCOVATORE_WEB_TOKEN` non c'è protezione: va bene finché la porta resta in LAN. Con il token impostato si apre una volta `http://nasgul:8482/?token=...` e il browser lo ricorda. Da riga di comando: `python -m scovatore web [--porta 8482]`.
+
+### Log
+
+A livello `INFO` (default) il log dice sempre cosa sta facendo: inizio e fine di ogni fase con la durata, ogni ricerca (marketplace, query, risultati, quanti mai visti nel giro), la provenienza degli annunci per paese, gli scarti dei filtri locali raggruppati per motivo, ogni blocco di scrematura con il conteggio si/forse/no, ogni verifica con esito e punteggio, e un riepilogo a fine giro. Nel `loop` dice anche quando scade ogni caccia e a che ora c'è il prossimo controllo. Le chiamate LLM oltre i 60 secondi vengono segnalate.
+
+Con `-v` o `SCOVATORE_LOG_LEVEL=DEBUG` si aggiungono il motivo di ogni singolo scarto, le query del piano, i parametri di ogni chiamata eBay e tempi e token di ogni chiamata LLM.
+
 **Consiglio per la prima volta**: lancia `piano` e guarda le query prima di `esegui`. Se Palantir produce query troppo generiche o troppo specifiche, correggi `ricerca` oppure aggiungi `query_extra`.
 
 ## Definire una caccia
@@ -122,7 +140,8 @@ attiva: true
 ogni_minuti: 240
 
 ebay:                          # tutto quello che eBay sa filtrare
-  marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR]
+  marketplaces: ue             # tutti i siti eBay della UE
+  paesi_ammessi: ue            # oggetto situato in uno dei 27 paesi UE
   prezzo_max: 150
   spedizione_inclusa: true
   regione: EUROPEAN_UNION
@@ -141,7 +160,9 @@ requisiti_avanzati: |          # per Groq: cosa verificare sul dettaglio
 
 | Campo | Default | Filtro eBay / effetto |
 |---|---|---|
-| `marketplaces` | `[EBAY_IT]` | un giro di query per ciascuno, con query nella sua lingua più l'inglese |
+| `marketplaces` | `ue` | un giro di query per ciascuno, nella sua lingua più l'inglese. `ue` = `EBAY_IT, DE, FR, ES, NL, BE, AT, IE, PL`; si può mescolare: `[ue, EBAY_GB]` |
+| `paesi_ammessi` | `ue` | controllo locale sul paese in cui si trova l'oggetto: `ue` (i 27 stati membri), una lista ISO (`[IT, DE, LT]`, anche `[ue, CH]`) oppure `tutti` |
+| `max_ricerche` | `150` | tetto di ricerche (query x marketplace) per giro; se taglia, taglia le query meno importanti su tutti i marketplace |
 | `valuta` | `EUR` | `priceCurrency`; gli annunci in altra valuta vengono scartati |
 | `prezzo_min`, `prezzo_max` | nessuno | `price:[min..max]` |
 | `spedizione_inclusa` | `true` | il budget vale su prezzo + spedizione (controllo locale) |
@@ -159,6 +180,17 @@ requisiti_avanzati: |          # per Groq: cosa verificare sul dettaglio
 | `ordinamento` | `newlyListed` | `sort`: `price`, `-price`, `newlyListed`, `endingSoonest` |
 | `max_risultati_per_query` | `100` | paginazione, massimo 200 per pagina |
 | `feedback_minimo` | nessuno | % minima di feedback del venditore (controllo locale) |
+
+#### Tutta la UE, non solo i paesi con un eBay
+
+Non esiste un eBay per ogni paese: chi vende dalla Lituania, dalla Repubblica Ceca o dalla Slovenia pubblica su uno dei siti esistenti, quasi sempre ebay.de. Per questo la copertura UE sta in due filtri, non nell'elenco dei marketplace:
+
+- `regione: EUROPEAN_UNION` chiede a eBay solo oggetti situati nella UE (supportato da tutti i marketplace europei);
+- `paesi_ammessi: ue` ricontrolla in locale il paese dell'annuncio contro i 27 stati membri. Serve perché le aree geografiche di eBay non coincidono per forza con l'unione doganale: Regno Unito, Svizzera e Norvegia costano dogana e IVA all'import.
+
+I marketplace in più servono a far girare le query nella lingua locale (un venditore polacco scrive il titolo in polacco anche su ebay.de), e come rete di sicurezza per gli annunci visibili solo su un sito. Il log di ogni giro dice quanti annunci nuovi ha portato ciascun marketplace: se uno porta sempre zero, toglilo dalla lista.
+
+**Costo in chiamate.** Con 9 marketplace, 4 query per lingua e 2 `query_extra` un giro fa circa 85 ricerche più fino a 25 dettagli. Una caccia ogni 3 ore sta intorno alle 900 chiamate al giorno, contro le 5000 di eBay. Cambiare i marketplace cambia le lingue, quindi al primo giro Palantir rigenera il piano.
 
 Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabile solo insieme a una categoria foglia. Senza `categorie` è meglio lasciarlo vuoto: altrimenti si rischiano risultati mancanti.
 
@@ -228,6 +260,7 @@ scovatore/
   pipeline.py   orchestrazione di un giro
   db.py         SQLite: piani, esecuzioni, annunci, verdetti
   notify.py     ntfy
+  web.py        interfaccia web in sola lettura (solo libreria standard)
   cli.py        comandi
 cacce/          definizioni delle cacce
 dati/           dati di riferimento per Groq
@@ -242,8 +275,8 @@ pip install pytest
 python -m pytest -q
 ```
 
-I test non chiamano servizi esterni: eBay, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay.
+I test non chiamano servizi esterni: eBay, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, alias `ue` e filtro paesi, tetto di ricerche, migrazione del DB, pagine e token dell'interfaccia web, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay.
 
 ## Integrazione con GILPA (prossimo passo)
 
-Il DB è autonomo (`data/scovatore.db`). GILPA può leggerlo in sola lettura per una schermata "Cacce attive", oppure Scovatore può esporre una piccola API. Più avanti, l'intent di `/api/chat` "cercami un..." può generare direttamente il file YAML di una caccia.
+Il DB è autonomo (`data/scovatore.db`). GILPA può usare le API JSON di `scovatore-web` (`/api/caccia/<nome>`, `/api/giri`) per una schermata "Cacce attive". Più avanti, l'intent di `/api/chat` "cercami un..." può generare direttamente il file YAML di una caccia.

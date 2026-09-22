@@ -16,6 +16,27 @@ services:
     networks:
       - palantir
 
+  # Interfaccia web in sola lettura sui risultati: http://<nasgul>:8482
+  scovatore-web:
+    build: .
+    container_name: scovatore-web
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCOVATORE_DATA_DIR: /app/data
+      SCOVATORE_HUNTS_DIR: /app/cacce
+      SCOVATORE_DB: /app/data/scovatore.db
+    command: ["python", "-m", "scovatore", "web", "--porta", "8482"]
+    ports:
+      - "${SCOVATORE_WEB_PORT:-8482}:8482"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8482/salute')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
 # Rete del compose di Palantir, per raggiungere il gateway per nome.
 # Verifica il nome reale con: docker network ls
 networks:
