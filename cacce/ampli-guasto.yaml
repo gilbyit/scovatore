@@ -5,7 +5,9 @@ attiva: true
 ogni_minuti: 240
 
 ebay:
-  marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR]
+  marketplaces: ue              # tutti i siti eBay UE (IT DE FR ES NL BE AT IE PL)
+  paesi_ammessi: ue             # oggetto in uno dei 27 paesi UE: niente dogana. Anche [IT, DE, LT] o tutti
+  max_ricerche: 150             # tetto di ricerche per giro (query x marketplace)
   valuta: EUR
   prezzo_max: 150               # da regolare
   spedizione_inclusa: true

@@ -6,7 +6,9 @@ ogni_minuti: 180
 
 # --- Parametri eBay: tutto cio' che eBay filtra da solo -------------------
 ebay:
-  marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR, EBAY_ES]
+  marketplaces: ue              # tutti i siti eBay UE (IT DE FR ES NL BE AT IE PL)
+  paesi_ammessi: ue             # oggetto in uno dei 27 paesi UE: niente dogana. Anche [IT, DE, LT] o tutti
+  max_ricerche: 150             # tetto di ricerche per giro (query x marketplace)
   valuta: EUR
   prezzo_max: 100
   spedizione_inclusa: true      # il budget vale su prezzo + spedizione (controllo locale)
