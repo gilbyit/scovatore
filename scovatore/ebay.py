@@ -201,6 +201,7 @@ class EbayClient:
         if r.status_code != 200:
             raise EbayError(f"OAuth eBay fallito ({r.status_code}): {r.text[:300]}")
         body = r.json()
+        log.debug("eBay: nuovo token OAuth, scade fra %s s", body.get("expires_in"))
         self._token = body["access_token"]
         self._token_exp = time.time() + int(body.get("expires_in", 7200))
         return self._token
@@ -216,11 +217,15 @@ class EbayClient:
         for attempt in range(3):
             self.calls += 1
             r = self.http.get(f"{self.api_base}{path}", params=params, headers=headers)
+            log.debug("eBay %s %s -> %d (chiamata %d/%d)", marketplace, path.rsplit("/", 1)[-1][:40],
+                      r.status_code, self.calls, self.call_budget)
             if r.status_code == 401 and attempt == 0:
+                log.info("eBay: token scaduto, lo rinnovo")
                 self._token = None
                 headers["Authorization"] = f"Bearer {self._get_token()}"
                 continue
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                log.warning("eBay %s: %d, riprovo fra %d s", marketplace, r.status_code, 2 * (attempt + 1))
                 time.sleep(2 * (attempt + 1))
                 continue
             if r.status_code == 404:
@@ -245,8 +250,13 @@ class EbayClient:
             cats = p.categorie.get(marketplace)
             if cats:
                 params["category_ids"] = ",".join(str(c) for c in cats)
+            log.debug("eBay search %s q=%r offset=%d params=%s", marketplace, query, offset,
+                      {k: v for k, v in params.items() if k not in ("q", "offset")})
             body = self._get("/buy/browse/v1/item_summary/search", marketplace, params)
             items = body.get("itemSummaries") or []
+            if body.get("warnings"):
+                log.warning("eBay %s '%s': avvisi %s", marketplace, query,
+                            [w.get("message") for w in body["warnings"]][:3])
             out.extend(parse_summary(i, marketplace, query) for i in items)
             total = int(body.get("total") or 0)
             offset += page

@@ -48,10 +48,16 @@ CREATE TABLE IF NOT EXISTS items (
     score INTEGER,
     verify_json TEXT,
     notified INTEGER DEFAULT 0,
+    image TEXT,
     PRIMARY KEY (hunt, legacy_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_score ON items(hunt, score DESC);
 """
+
+# Colonne aggiunte dopo la prima versione: (tabella, colonna, tipo). Applicate all'avvio se mancano.
+MIGRATIONS = [
+    ("items", "image", "TEXT"),
+]
 
 
 def now() -> str:
@@ -64,6 +70,10 @@ class DB:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        for table, col, typ in MIGRATIONS:
+            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -116,15 +126,16 @@ class DB:
         if existing is None:
             self.conn.execute(
                 """INSERT INTO items (hunt, legacy_id, item_id, marketplace, title, url, price, shipping,
-                   total, currency, condition, country, seller, is_auction, end_date, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   total, currency, condition, country, seller, is_auction, end_date, first_seen, last_seen, image)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (hunt, l.legacy_id, l.item_id, l.marketplace, l.title, l.url, l.price, l.shipping,
-                 l.total, l.currency, l.condition, l.country, l.seller, int(l.is_auction), l.end_date, t, t))
+                 l.total, l.currency, l.condition, l.country, l.seller, int(l.is_auction), l.end_date, t, t,
+                 l.image))
         else:
             self.conn.execute(
-                """UPDATE items SET title=?, url=?, price=?, shipping=?, total=?, last_seen=?, end_date=?
-                   WHERE hunt=? AND legacy_id=?""",
-                (l.title, l.url, l.price, l.shipping, l.total, t, l.end_date, hunt, l.legacy_id))
+                """UPDATE items SET title=?, url=?, price=?, shipping=?, total=?, last_seen=?, end_date=?,
+                   image=COALESCE(NULLIF(?, ''), image) WHERE hunt=? AND legacy_id=?""",
+                (l.title, l.url, l.price, l.shipping, l.total, t, l.end_date, l.image, hunt, l.legacy_id))
         self.conn.commit()
         return existing is None
 

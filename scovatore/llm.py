@@ -109,12 +109,18 @@ class LLMClient:
             else:
                 body.pop("response_format", None)
             self.bucket.wait(est)
+            log.debug("%s: richiesta %s (~%d token stimati, tentativo %d)", self.cfg.name, self.cfg.model,
+                      est, attempt + 1)
+            t0 = time.monotonic()
             try:
                 r = self.http.post(f"{self.cfg.base_url}/chat/completions", json=body, headers=headers)
             except httpx.HTTPError as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
+                log.warning("%s: errore di rete dopo %.1f s (%s), riprovo fra %d s", self.cfg.name,
+                            time.monotonic() - t0, last_err, 3 * (attempt + 1))
                 time.sleep(3 * (attempt + 1))
                 continue
+            dt = time.monotonic() - t0
             self.calls += 1
             if r.status_code == 429:
                 wait = float(r.headers.get("retry-after") or 20)
@@ -127,14 +133,20 @@ class LLMClient:
                 continue
             if r.status_code >= 500:
                 last_err = f"{r.status_code}: {r.text[:200]}"
+                log.warning("%s: errore %d dopo %.1f s, riprovo", self.cfg.name, r.status_code, dt)
                 time.sleep(3 * (attempt + 1))
                 continue
             if r.status_code >= 400:
                 raise LLMError(f"{self.cfg.name} {r.status_code}: {r.text[:400]}")
             data = r.json()
             usage = data.get("usage") or {}
-            self.tokens_in += int(usage.get("prompt_tokens") or 0)
-            self.tokens_out += int(usage.get("completion_tokens") or 0)
+            t_in = int(usage.get("prompt_tokens") or 0)
+            t_out = int(usage.get("completion_tokens") or 0)
+            self.tokens_in += t_in
+            self.tokens_out += t_out
+            log.debug("%s: risposta in %.1f s, token %d in / %d out", self.cfg.name, dt, t_in, t_out)
+            if dt > 60:
+                log.info("%s: risposta lenta, %.0f s (token %d in / %d out)", self.cfg.name, dt, t_in, t_out)
             content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             try:
                 return extract_json(content)

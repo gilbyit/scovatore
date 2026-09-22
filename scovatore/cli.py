@@ -66,6 +66,10 @@ def _print_stats(name: str, s) -> None:
     print(f"scremati {s.scremati} (no: {s.scremati_no}) | verificati {s.verificati} | conformi {s.conformi} "
           f"| notificati {s.notificati}")
     print(f"chiamate eBay {s.chiamate_ebay} | token Palantir {s.token_palantir} | token Groq {s.token_groq}")
+    if s.scartati_paese or s.ricerche_saltate:
+        print(f"scartati per paese {s.scartati_paese} | ricerche saltate per max_ricerche {s.ricerche_saltate}")
+    if s.durate:
+        print("durate: " + ", ".join(f"{k} {v:.0f}s" for k, v in s.durate.items()))
     for e in s.errori:
         print(f"  ! {e}")
 
@@ -106,13 +110,29 @@ def _due(cfg: Config, hunt: Hunt) -> bool:
     return datetime.now(timezone.utc) - datetime.fromisoformat(last) >= timedelta(minutes=hunt.ogni_minuti)
 
 
+def _minutes_to_due(cfg: Config, hunt: Hunt) -> float:
+    db = DB(cfg.db_path)
+    try:
+        last = db.last_run_at(hunt.nome)
+    finally:
+        db.close()
+    if not last:
+        return 0.0
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 60
+    return max(0.0, hunt.ogni_minuti - elapsed)
+
+
 def cmd_tutte(cfg: Config, args) -> int:
     rc = 0
-    for hunt in load_all(cfg.hunts_dir):
+    hunts = load_all(cfg.hunts_dir)
+    log.info("controllo %d cacce (%d attive)", len(hunts), sum(h.attiva for h in hunts))
+    for hunt in hunts:
         if not hunt.attiva:
+            log.info("%s: disattivata, salto", hunt.nome)
             continue
         if not args.forza and not _due(cfg, hunt):
-            log.info("%s: non ancora dovuta", hunt.nome)
+            log.info("%s: non ancora dovuta, prossimo giro fra %.0f min (ogni %d)", hunt.nome,
+                     _minutes_to_due(cfg, hunt), hunt.ogni_minuti)
             continue
         try:
             _run(cfg, hunt)
@@ -130,6 +150,10 @@ def cmd_loop(cfg: Config, args) -> int:
             cmd_tutte(cfg, args)
         except HuntError as exc:
             log.error("definizione cacce non valida: %s", exc)
+        except Exception as exc:  # il loop non deve morire per un errore imprevisto
+            log.exception("errore nel giro di controllo: %s", exc)
+        nxt = datetime.now() + timedelta(minutes=args.intervallo)
+        log.info("in attesa, prossimo controllo alle %s", nxt.strftime("%H:%M"))
         time.sleep(args.intervallo * 60)
 
 
@@ -140,11 +164,11 @@ def _show(cfg: Config, name: str, min_score: int, limit: int, tutti: bool, csv_p
     if not rows:
         print("Nessun risultato verificato.")
         return
-    print(f"\n{'punti':>5} {'esito':<13} {'totale':>8}  titolo")
+    print(f"\n{'punti':>5} {'esito':<13} {'totale':>8} {'paese':<5} titolo")
     for r in rows:
         score = "-" if r["score"] is None else str(r["score"])
         verdict = r["verdict"] or f"({r['screen_verdict'] or '?'})"
-        print(f"{score:>5} {verdict:<13} {r['total']:>8.2f}  {r['title'][:70]}")
+        print(f"{score:>5} {verdict:<13} {r['total']:>8.2f} {r['country'] or '?':<5} {r['title'][:66]}")
         if r["verify_json"]:
             v = json.loads(r["verify_json"])
             if v.get("sintesi"):
@@ -179,10 +203,20 @@ def cmd_controlla(cfg: Config, args) -> int:
             h.reference_text()
             print(f"ok  caccia {h.nome} ({'attiva' if h.attiva else 'disattiva'}, ogni {h.ogni_minuti} min) "
                   f"filtro: {build_filter(h.ebay)}")
+            allowed = h.ebay.allowed_countries()
+            print(f"      marketplace: {','.join(m.removeprefix('EBAY_') for m in h.ebay.marketplaces)} | "
+                  f"paesi ammessi: {'tutti' if allowed is None else 'UE27' if len(allowed) == 27 else ','.join(sorted(allowed))}"
+                  f" | max_ricerche {h.ebay.max_ricerche}")
     except HuntError as exc:
         print(f"ERRORE {exc}")
         ok = False
     return 0 if ok else 1
+
+
+def cmd_web(cfg: Config, args) -> int:
+    from .web import serve
+    serve(cfg, args.host, args.porta)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--csv", help="scrivi anche un CSV")
     p.set_defaults(fn=cmd_risultati)
 
+    p = sub.add_parser("web", help="interfaccia web in sola lettura sui risultati")
+    p.add_argument("--host", help="default SCOVATORE_WEB_HOST (0.0.0.0)")
+    p.add_argument("--porta", type=int, help="default SCOVATORE_WEB_PORT (8482)")
+    p.set_defaults(fn=cmd_web)
+
     p = sub.add_parser("controlla", help="verifica .env e definizioni delle cacce")
     p.set_defaults(fn=cmd_controlla)
 
@@ -226,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level="DEBUG" if args.verbose else cfg.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     try:
         return args.fn(cfg, args)
     except HuntError as exc:

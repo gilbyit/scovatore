@@ -78,6 +78,11 @@ class Config:
 
     log_level: str
 
+    # Interfaccia web
+    web_host: str = "0.0.0.0"
+    web_port: int = 8482
+    web_token: str = ""           # vuoto = nessuna protezione (uso in LAN)
+
     @property
     def ebay_api_base(self) -> str:
         return "https://api.sandbox.ebay.com" if self.ebay_env == "sandbox" else "https://api.ebay.com"
@@ -134,4 +139,7 @@ def load_config(env_file: str | None = None) -> Config:
         ntfy_url=_str("SCOVATORE_NTFY_URL"),
         ntfy_token=_str("SCOVATORE_NTFY_TOKEN"),
         log_level=_str("SCOVATORE_LOG_LEVEL", "INFO").upper(),
+        web_host=_str("SCOVATORE_WEB_HOST", "0.0.0.0"),
+        web_port=_int("SCOVATORE_WEB_PORT", 8482),
+        web_token=_str("SCOVATORE_WEB_TOKEN"),
     )

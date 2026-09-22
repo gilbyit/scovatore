@@ -286,3 +286,136 @@ def test_daily_ebay_budget_counts_previous_runs(env):
     assert s.chiamate_ebay > 0
     assert db.ebay_calls_today() == s.chiamate_ebay
     db.close()
+
+
+# ---------------------------------------------------------------- UE, tetto ricerche, web
+from scovatore.hunt import EU27, EU_MARKETPLACES  # noqa: E402
+from scovatore.pipeline import search_tasks  # noqa: E402
+
+
+def test_marketplaces_ue_alias_and_default():
+    h = parse_hunt({"ricerca": "x", "ebay": {"marketplaces": "ue"}})
+    assert h.ebay.marketplaces == EU_MARKETPLACES
+    h = parse_hunt({"ricerca": "x", "ebay": {"marketplaces": ["EBAY_GB", "ue", "ebay_it"]}})
+    assert h.ebay.marketplaces[0] == "EBAY_GB" and h.ebay.marketplaces.count("EBAY_IT") == 1
+    assert len(h.ebay.marketplaces) == 1 + len(EU_MARKETPLACES)
+    assert parse_hunt({"ricerca": "x"}).ebay.marketplaces == EU_MARKETPLACES
+    with pytest.raises(HuntError):
+        parse_hunt({"ricerca": "x", "ebay": {"marketplaces": ["EBAY_LT"]}})
+
+
+def test_paesi_ammessi():
+    assert parse_hunt({"ricerca": "x"}).ebay.allowed_countries() == EU27
+    assert parse_hunt({"ricerca": "x", "ebay": {"paesi_ammessi": "tutti"}}).ebay.allowed_countries() is None
+    h = parse_hunt({"ricerca": "x", "ebay": {"paesi_ammessi": ["lt", "lv"]}})
+    assert h.ebay.allowed_countries() == {"LT", "LV"}
+    h = parse_hunt({"ricerca": "x", "ebay": {"paesi_ammessi": ["ue", "ch"]}})
+    assert "CH" in h.ebay.allowed_countries() and "LT" in h.ebay.allowed_countries()
+    with pytest.raises(HuntError):
+        parse_hunt({"ricerca": "x", "ebay": {"paesi_ammessi": ["Lituania"]}})
+    h = parse_hunt({"ricerca": "x", "ebay": {"regione": None, "paese": "ch"}})
+    assert h.ebay.allowed_countries() == {"CH"}
+
+
+def test_local_reject_country():
+    from scovatore.ebay import parse_summary
+    h = parse_hunt(HUNT)
+    lt = parse_summary(summary(10, "X79 bundle", 50, country="LT"), "EBAY_DE", "q")
+    gb = parse_summary(summary(11, "X79 bundle", 50, country="GB"), "EBAY_DE", "q")
+    ch = parse_summary(summary(12, "X79 bundle", 50, country="CH"), "EBAY_DE", "q")
+    assert local_reject_reason(lt, h, []) is None
+    assert local_reject_reason(gb, h, []).startswith("paese GB")
+    assert local_reject_reason(ch, h, []).startswith("paese CH")
+
+
+def test_search_tasks_round_robin_and_cap(env):
+    plan = {"query": {"it": ["a1", "a2"], "de": ["b1"], "en": ["e1"]}, "parole_escluse": [], "requisiti_base": []}
+    h = parse_hunt({**HUNT, "query_extra": []})
+    tasks = search_tasks(h, plan)
+    # prima la query n.1 di ogni marketplace, poi la n.2...
+    assert tasks[:2] == [("EBAY_IT", "a1"), ("EBAY_DE", "b1")]
+    assert ("EBAY_IT", "e1") in tasks and ("EBAY_DE", "e1") in tasks
+
+    fake, llm = FakeEbay(), FakeLLM()
+    h = parse_hunt({**HUNT, "ebay": {**HUNT["ebay"], "max_ricerche": 2}})
+    ebay, pal, groq = make_clients(env, fake, llm)
+    db = DB(env.db_path)
+    stats = run_hunt(h, env, db, ebay, pal, groq)
+    assert stats.query == 2 and len(fake.searches) == 2
+    assert stats.ricerche_saltate > 0
+    assert {mp for mp, _, _ in fake.searches} == {"EBAY_IT", "EBAY_DE"}
+    assert set(stats.durate) >= {"piano", "ricerca", "totale"}
+
+
+def _seeded_db(env):
+    fake, llm = FakeEbay(), FakeLLM()
+    ebay, pal, groq = make_clients(env, fake, llm)
+    db = DB(env.db_path)
+    run_hunt(parse_hunt(HUNT), env, db, ebay, pal, groq)
+    db.close()
+
+
+def test_db_migration_adds_image_column(tmp_path):
+    import sqlite3
+    path = tmp_path / "vecchio.db"
+    from scovatore.db import SCHEMA
+    old_schema = SCHEMA.replace("    image TEXT,\n", "")   # schema della prima versione
+    assert "image" not in old_schema
+    conn = sqlite3.connect(path)
+    conn.executescript(old_schema)
+    conn.commit()
+    conn.close()
+    db = DB(path)
+    cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(items)")}
+    assert "image" in cols
+
+
+def test_web_pages(env):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from scovatore.web import make_handler
+
+    _seeded_db(env)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(env))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        with httpx.Client(base_url=base) as c:
+            home = c.get("/")
+            assert home.status_code == 200 and "test-mobo" in home.text and "conformi" in home.text
+            page = c.get("/caccia/test-mobo")
+            assert page.status_code == 200 and "Xeon E5-1650" in page.text and "Dettagli" in page.text
+            # filtro esito: gli scartati dalla scrematura sono solo la custodia
+            scart = c.get("/caccia/test-mobo", params={"esito": "scartati"})
+            assert "Custodia" in scart.text and "Xeon" not in scart.text
+            assert c.get("/caccia/test-mobo", params={"min": 90}).text.count('class="item"') == 0
+            assert c.get("/caccia/test-mobo", params={"giorni": 1, "esito": "tutti"}).text.count('class="item"') >= 3
+            api = c.get("/api/caccia/test-mobo").json()
+            assert api[0]["score"] == 85 and api[0]["verifica"]["esito"] == "conforme"
+            assert "Giri recenti" in c.get("/giri").text
+            assert c.get("/caccia/inesistente").status_code == 404
+            # niente HTML iniettato dai titoli
+            assert "<script>" not in page.text
+    finally:
+        srv.shutdown()
+
+
+def test_web_token(env, monkeypatch):
+    import threading
+    from dataclasses import replace
+    from http.server import ThreadingHTTPServer
+    from scovatore.web import make_handler
+
+    _seeded_db(env)
+    cfg = replace(env, web_token="segreto")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cfg))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        with httpx.Client(base_url=base) as c:
+            assert c.get("/").status_code == 401
+            r = c.get("/giri", params={"token": "segreto"})
+            assert r.status_code == 303 and r.headers["location"] == "/giri"
+            assert c.get("/giri").status_code == 200      # cookie impostato
+    finally:
+        srv.shutdown()
