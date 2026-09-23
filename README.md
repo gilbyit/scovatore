@@ -2,7 +2,7 @@
 
 Cacciatore di annunci eBay per NASGUL. Gli descrivi a parole cosa cerchi, senza marca e modello, e lui:
 
-1. fa generare a **Palantir** le query di ricerca (sinonimi, varianti, più lingue);
+1. fa generare a **Palantir** o a **Groq** (a scelta, `SCOVATORE_PLAN_LLM`) le query di ricerca (sinonimi, varianti, più lingue);
 2. lancia le ricerche sulla **Browse API** di eBay con i filtri strutturati (prezzo, area geografica, condizione...);
 3. scarta in locale quello che non rientra (budget con spedizione, valuta, parole escluse, feedback);
 4. fa scremare i titoli a **Palantir**, a blocchi (si / forse / no);
@@ -40,7 +40,7 @@ Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
 |---|---|---|
 | Prezzo, valuta, area geografica, paese di consegna, condizione, formato, venditori | eBay (parametri YAML) | eBay li filtra meglio e gratis |
 | Budget con spedizione inclusa, parole escluse, feedback minimo | Scovatore in locale | deterministico, zero token |
-| Query sinonime a partire dagli elementi chiave | Palantir | è lavoro linguistico, gira in locale, nessun limite di token |
+| Query sinonime a partire dagli elementi chiave | Palantir o Groq (`SCOVATORE_PLAN_LLM`) | una sola chiamata per caccia, poi in cache: con Groq costa poche centinaia di token e sbaglia meno |
 | Scrematura dei titoli | Palantir | taglia il rumore prima di spendere token Groq |
 | Requisiti avanzati (TDP, PassMark, diagnosi da sintomi...) | Groq | serve conoscenza di dominio, un modello da 4B non basta |
 
@@ -128,6 +128,12 @@ A livello `INFO` (default) il log dice sempre cosa sta facendo: inizio e fine di
 
 Con `-v` o `SCOVATORE_LOG_LEVEL=DEBUG` si aggiungono il motivo di ogni singolo scarto, le query del piano, i parametri di ogni chiamata eBay e tempi e token di ogni chiamata LLM.
 
+### Chi genera il piano
+
+`SCOVATORE_PLAN_LLM=palantir` (default) o `groq`. Il piano è una sola chiamata per caccia e resta in cache, quindi farlo con Groq costa poco; la scrematura dei titoli resta comunque a Palantir. Se il modello scelto non è configurato, Scovatore usa l'altro e lo scrive nel log. Cambiare impostazione rigenera il piano al giro successivo.
+
+Qualunque sia il modello, le query fatte solo di parole di stato o generiche ("non funzionante", "defekt", "for parts", "usato"...) vengono scartate prima di arrivare a eBay e segnalate nel log: da sole pescano in tutte le categorie. Il pianificatore riceve anche i filtri che eBay applica già: se la caccia chiede solo oggetti guasti, sa che le parole di stato sono superflue e concentra le query sul tipo di oggetto.
+
 **Consiglio per la prima volta**: lancia `piano` e guarda le query prima di `esegui`. Se Palantir produce query troppo generiche o troppo specifiche, correggi `ricerca` oppure aggiungi `query_extra`.
 
 ## Definire una caccia
@@ -212,7 +218,7 @@ Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabil
 
 Ogni giro ricerca sempre su eBay, ma i passaggi LLM si ripetono solo quando serve:
 
-- **piano**: in cache finché non cambiano `ricerca`, marketplace (lingue) o `max_query_per_lingua`. Forzabile con `--rigenera` / `--rigenera-piano`;
+- **piano**: in cache finché non cambiano `ricerca`, marketplace (lingue), `max_query_per_lingua`, condizioni, il modello che lo genera o il prompt. Forzabile con `--rigenera` / `--rigenera-piano`;
 - **scrematura**: una volta per annuncio;
 - **verifica Groq**: una volta per annuncio, ripetuta se cambiano `ricerca`, `requisiti_avanzati` o `dati_riferimento`, oppure se il prezzo totale si muove di oltre il 5% (aste, ribassi);
 - **notifica**: una volta per annuncio.

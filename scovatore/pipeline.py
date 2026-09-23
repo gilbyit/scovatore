@@ -1,6 +1,7 @@
 """La pipeline di una caccia: piano -> ricerca -> filtri -> scrematura -> verifica -> notifica."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -58,48 +59,118 @@ def phase(stats: RunStats, name: str, hunt: str):
 # ---------------------------------------------------------------------------
 # 1. Piano
 # ---------------------------------------------------------------------------
+# Parole che da sole non identificano un oggetto: stato, condizione, riempitivi.
+# Una query fatta solo di queste ("non funzionante", "defekt", "for parts") pesca in tutte
+# le categorie di eBay e porta migliaia di risultati inutili.
+GENERIC_WORDS = frozenset("""
+guasto guasta guasti guaste non funzionante funzionanti funziona funzionano difettoso difettosa difettosi
+per ricambi ricambio pezzi da riparare riparazione rotto rotta rotti usato usata usati testato testata
+nuovo nuova ottimo stato perfetto lotto stock bundle kit set con senza e o il la lo i gli le un una di del
+defekt defekte defekter defektes für bastler bastlerware ersatzteile ersatzteil nicht funktioniert
+funktionsfähig funktionsfähige ungetestet reparatur gebraucht neu und mit ohne der die das ein eine
+faulty broken for parts part spares spare repair not working untested as is used new and with without the a of
+hs en panne pour pièces pieces pièce défectueux défectueuse ne fonctionne pas réparer occasion neuf et avec sans
+averiado averiada averiados para piezas repuesto repuestos no funciona roto rota reparar usado nuevo y con sin
+defect kapot onderdelen voor niet werkend werkt reparatie gebruikt nieuw en met zonder
+uszkodzony uszkodzona uszkodzone na części czesci nie działa dziala sprawny naprawy używany uzywany nowy
+""".split())
+
+
+def is_generic_query(q: str) -> bool:
+    """True se la query non contiene nessuna parola che indichi un oggetto."""
+    words = [w for w in re.split(r"[^\w]+", q.lower()) if w]
+    return not words or all(w in GENERIC_WORDS for w in words)
+
+
 def normalize_plan(raw: dict, languages: list[str], per_lang: int) -> dict:
     queries = raw.get("query") or {}
     if isinstance(queries, list):  # il modello ha ignorato la struttura per lingua
         queries = {"en": queries}
     clean: dict[str, list[str]] = {}
+    dropped: list[str] = []
     for lang in languages:
         seen: list[str] = []
         for q in queries.get(lang) or []:
             q = re.sub(r"\s+", " ", str(q)).strip().strip('"')
-            if q and q.lower() not in (s.lower() for s in seen):
-                seen.append(q)
+            if not q or q.lower() in (s.lower() for s in seen):
+                continue
+            if is_generic_query(q):
+                dropped.append(f"{lang}: {q}")
+                continue
+            seen.append(q)
         clean[lang] = seen[:per_lang]
+    if dropped:
+        log.warning("query generiche scartate dal piano (solo parole di stato, nessun oggetto): %s", dropped)
     return {
         "elementi_chiave": [str(x) for x in raw.get("elementi_chiave") or []],
         "query": clean,
         "parole_escluse": [str(x).lower() for x in raw.get("parole_escluse") or []][:8],
         "requisiti_base": [str(x) for x in raw.get("requisiti_base") or []][:5],
+        "scartate": dropped,
     }
 
 
-def get_plan(hunt: Hunt, db: DB, palantir: LLMClient | None, force: bool = False) -> dict:
+def plan_note(hunt: Hunt) -> str:
+    """Descrive al pianificatore i filtri che eBay applica gia', per non sprecare parole nelle query."""
+    notes = []
+    conds = set(hunt.ebay.condizioni)
+    if conds and conds <= {7000}:
+        notes.append("solo oggetti in condizione 'per ricambi o non funzionante' (le parole di stato "
+                     "come guasto/defekt/for parts sono quindi superflue)")
+    elif conds and 7000 not in conds and conds <= {1000, 1500}:
+        notes.append("solo oggetti nuovi")
+    elif conds and 7000 not in conds:
+        notes.append("solo oggetti funzionanti (nuovi, usati o ricondizionati)")
+    if hunt.ebay.categorie:
+        notes.append("ricerca limitata a categorie specifiche")
+    return "; ".join(notes)
+
+
+def pick_planner(cfg: Config, palantir: LLMClient | None, groq: LLMClient | None) -> LLMClient | None:
+    """Il modello che genera il piano, secondo SCOVATORE_PLAN_LLM, con ripiego sull'altro."""
+    want, other = (groq, palantir) if cfg.plan_llm == "groq" else (palantir, groq)
+    if want is not None:
+        return want
+    if other is not None:
+        log.warning("SCOVATORE_PLAN_LLM=%s ma %s non e' configurato: il piano lo genera %s",
+                    cfg.plan_llm, cfg.plan_llm, other.cfg.name)
+    return other
+
+
+def plan_key(hunt: Hunt, llm: LLMClient | None) -> str:
+    """Chiave della cache del piano: cambia con la caccia, con chi lo genera e con il prompt."""
+    who = f"{llm.cfg.name}:{llm.cfg.model}" if llm else "nessuno"
+    src = f"{hunt.plan_hash}|{who}|{prompts.PLAN_SYSTEM}|{plan_note(hunt)}"
+    return hashlib.sha256(src.encode()).hexdigest()[:16]
+
+
+def get_plan(hunt: Hunt, db: DB, planner: LLMClient | None, force: bool = False) -> dict:
+    key = plan_key(hunt, planner)
     if not force:
-        cached = db.get_plan(hunt.nome, hunt.plan_hash)
+        cached = db.get_plan(hunt.nome, key)
         if cached:
-            log.info("[%s] piano in cache (%s): %s", hunt.nome, hunt.plan_hash, _plan_summary(cached))
+            log.info("[%s] piano in cache (%s, %s): %s", hunt.nome, key,
+                     planner.cfg.name if planner else "?", _plan_summary(cached))
             return cached
-    log.info("[%s] genero il piano con Palantir per le lingue %s%s", hunt.nome, ",".join(hunt.languages()),
-             " (rigenerazione forzata)" if force else "")
-    if palantir is None:
-        raise LLMError("serve Palantir per generare il piano (o usa solo query_extra)")
+    if planner is None:
+        raise LLMError("serve Palantir o Groq per generare il piano (o usa solo query_extra)")
+    note = plan_note(hunt)
+    log.info("[%s] genero il piano con %s (%s) per le lingue %s%s", hunt.nome, planner.cfg.name,
+             planner.cfg.model, ",".join(hunt.languages()), " (rigenerazione forzata)" if force else "")
     langs = hunt.languages()
-    raw = palantir.chat_json(prompts.PLAN_SYSTEM,
-                             prompts.plan_user(hunt.ricerca, langs, hunt.max_query_per_lingua))
+    raw = planner.chat_json(prompts.PLAN_SYSTEM,
+                            prompts.plan_user(hunt.ricerca, langs, hunt.max_query_per_lingua, note),
+                            max_tokens=max(planner.cfg.max_tokens, 2000))
     if not isinstance(raw, dict):
-        raise LLMError("il piano di Palantir non e' un oggetto JSON")
+        raise LLMError(f"il piano di {planner.cfg.name} non e' un oggetto JSON")
     plan = normalize_plan(raw, langs, hunt.max_query_per_lingua)
+    plan["generato_da"] = f"{planner.cfg.name}:{planner.cfg.model}"
     if not any(plan["query"].values()) and not hunt.query_extra:
-        raise LLMError("Palantir non ha prodotto query utilizzabili")
-    db.save_plan(hunt.nome, hunt.plan_hash, plan)
+        raise LLMError(f"{planner.cfg.name} non ha prodotto query utilizzabili")
+    db.save_plan(hunt.nome, key, plan)
     log.info("[%s] piano nuovo: %s", hunt.nome, _plan_summary(plan))
     for lang, qs in plan["query"].items():
-        log.debug("[%s]   %s: %s", hunt.nome, lang, qs)
+        log.info("[%s]   %s: %s", hunt.nome, lang, qs)
     return plan
 
 
@@ -334,7 +405,7 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
              ebay.call_budget - ebay.calls)
     try:
         with phase(stats, "piano", hunt.nome):
-            plan = get_plan(hunt, db, palantir, force=force_plan)
+            plan = get_plan(hunt, db, pick_planner(cfg, palantir, groq), force=force_plan)
         excluded = [w.lower() for w in hunt.parole_escluse] + plan["parole_escluse"]
 
         with phase(stats, "ricerca", hunt.nome):

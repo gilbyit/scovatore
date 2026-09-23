@@ -15,7 +15,7 @@ from .db import DB
 from .ebay import EbayClient, EbayError, build_filter
 from .hunt import Hunt, HuntError, load_all, load_hunt
 from .llm import LLMClient, LLMError
-from .pipeline import get_plan, run_hunt
+from .pipeline import get_plan, pick_planner, run_hunt
 
 log = logging.getLogger("scovatore")
 
@@ -48,9 +48,10 @@ def _resolve(cfg: Config, name_or_path: str) -> Hunt:
 def cmd_piano(cfg: Config, args) -> int:
     hunt = _resolve(cfg, args.caccia)
     db = DB(cfg.db_path)
-    _, palantir, _ = _clients(cfg, need_ebay=False)
-    plan = get_plan(hunt, db, palantir, force=args.rigenera)
+    _, palantir, groq = _clients(cfg, need_ebay=False)
+    plan = get_plan(hunt, db, pick_planner(cfg, palantir, groq), force=args.rigenera)
     print(f"Caccia: {hunt.nome}")
+    print(f"Piano generato da: {plan.get('generato_da', '?')} (SCOVATORE_PLAN_LLM={cfg.plan_llm})")
     print(f"Filtro eBay: {build_filter(hunt.ebay)}")
     print(f"Marketplace: {', '.join(hunt.ebay.marketplaces)}")
     print(json.dumps(plan, ensure_ascii=False, indent=2))
@@ -197,6 +198,9 @@ def cmd_controlla(cfg: Config, args) -> int:
                       ("PALANTIR_BASE_URL", cfg.palantir.base_url), ("GROQ_API_KEY", cfg.groq.api_key)):
         print(f"{'ok ' if val else 'MANCA'} {name}")
         ok &= bool(val) or name == "GROQ_API_KEY"
+    print(f"ok  piano generato da: {cfg.plan_llm}")
+    if cfg.plan_llm == "groq" and not cfg.groq.api_key:
+        print("ATTENZIONE SCOVATORE_PLAN_LLM=groq ma GROQ_API_KEY manca: il piano lo fara' Palantir")
     try:
         hunts = load_all(cfg.hunts_dir)
         for h in hunts:

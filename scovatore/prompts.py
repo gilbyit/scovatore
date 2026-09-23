@@ -13,7 +13,9 @@ PLAN_SYSTEM = """Sei un esperto di ricerche su eBay. Ricevi la descrizione di ci
 
 Regole:
 - Estrai solo gli elementi chiave che compaiono nei titoli degli annunci (tipo di oggetto, caratteristiche distintive, stato). Ignora budget, spedizione, provenienza: sono gestiti a parte.
-- Per ogni lingua richiesta genera query brevi (2-5 parole), come le scriverebbe un venditore nel titolo. Usa sinonimi e varianti reali: per esempio in italiano "guasto", "non funzionante", "per ricambi", "difettoso"; in tedesco "defekt", "für Bastler"; in inglese "faulty", "for parts", "not working".
+- Per ogni lingua richiesta genera query brevi (2-5 parole), come le scriverebbe un venditore nel titolo.
+- OGNI query deve contenere il tipo di oggetto (per esempio "amplificatore", "verstärker", "amplifier", "scheda madre", "mainboard"). eBay cerca in tutte le categorie: una query fatta solo di parole di stato o generiche ("non funzionante", "guasto", "defekt", "for parts", "usato", "bundle") restituisce migliaia di oggetti di ogni tipo ed e' VIETATA.
+- Varia le query sui modi diversi di chiamare l'oggetto (sinonimi, sottotipi, termini tecnici usati nei titoli). Le parole di stato si aggiungono al nome dell'oggetto, mai da sole: "amplificatore guasto", "verstärker defekt", "amplifier for parts". Se le istruzioni dicono che la condizione e' gia' filtrata da eBay, le parole di stato non servono: usale al massimo in una query per lingua.
 - Le query devono essere diverse fra loro e coprire modi diversi di descrivere lo stesso oggetto. Niente query quasi identiche.
 - Non inventare marche o modelli che l'utente non ha nominato, a meno che siano sinonimi di categoria usati nei titoli (per esempio "X79" o "LGA2011" per piattaforme DDR3 quad channel).
 - "parole_escluse": termini che, se presenti nel titolo, indicano sicuramente un oggetto sbagliato (per esempio "solo scatola", "cover", "manuale"). Massimo 8. Lascia vuoto se non sei sicuro.
@@ -23,10 +25,13 @@ Rispondi SOLO con JSON in questo formato:
 {"elementi_chiave": ["..."], "query": {"<codice lingua>": ["...", "..."]}, "parole_escluse": ["..."], "requisiti_base": ["..."]}"""
 
 
-def plan_user(ricerca: str, languages: list[str], per_lang: int) -> str:
+def plan_user(ricerca: str, languages: list[str], per_lang: int, note: str = "") -> str:
     langs = ", ".join(f"{l} ({LANG_NAMES.get(l, l)})" for l in languages)
-    return (f"Richiesta dell'utente:\n\"\"\"\n{ricerca.strip()}\n\"\"\"\n\n"
-            f"Lingue: {langs}\nMassimo {per_lang} query per lingua.")
+    out = (f"Richiesta dell'utente:\n\"\"\"\n{ricerca.strip()}\n\"\"\"\n\n"
+           f"Lingue: {langs}\nMassimo {per_lang} query per lingua.")
+    if note:
+        out += f"\n\nFiltri gia' applicati da eBay: {note}"
+    return out
 
 
 # ---------------------------------------------------------------------------

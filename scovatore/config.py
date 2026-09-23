@@ -83,6 +83,9 @@ class Config:
     web_port: int = 8482
     web_token: str = ""           # vuoto = nessuna protezione (uso in LAN)
 
+    # Chi genera il piano delle query: palantir | groq
+    plan_llm: str = "palantir"
+
     @property
     def ebay_api_base(self) -> str:
         return "https://api.sandbox.ebay.com" if self.ebay_env == "sandbox" else "https://api.ebay.com"
@@ -142,4 +145,12 @@ def load_config(env_file: str | None = None) -> Config:
         web_host=_str("SCOVATORE_WEB_HOST", "0.0.0.0"),
         web_port=_int("SCOVATORE_WEB_PORT", 8482),
         web_token=_str("SCOVATORE_WEB_TOKEN"),
+        plan_llm=_plan_llm(),
     )
+
+
+def _plan_llm() -> str:
+    v = _str("SCOVATORE_PLAN_LLM", "palantir").lower()
+    if v not in ("palantir", "groq"):
+        raise ValueError(f"SCOVATORE_PLAN_LLM deve essere 'palantir' o 'groq', non {v!r}")
+    return v
