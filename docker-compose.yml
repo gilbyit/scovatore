@@ -43,4 +43,4 @@ services:
 networks:
   palantir:
     external: true
-    name: palantir_default
+    name: palantir
