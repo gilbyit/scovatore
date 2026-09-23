@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS items (
     verify_json TEXT,
     notified INTEGER DEFAULT 0,
     image TEXT,
+    hidden INTEGER DEFAULT 0,     -- 1 = eliminato a mano: la pipeline lo ignora
+    manual_verdict TEXT,          -- esito deciso dall'operatore, prevale su quello del modello
+    manual_note TEXT,
+    manual_at TEXT,
     PRIMARY KEY (hunt, legacy_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_score ON items(hunt, score DESC);
@@ -57,7 +61,13 @@ CREATE INDEX IF NOT EXISTS idx_items_score ON items(hunt, score DESC);
 # Colonne aggiunte dopo la prima versione: (tabella, colonna, tipo). Applicate all'avvio se mancano.
 MIGRATIONS = [
     ("items", "image", "TEXT"),
+    ("items", "hidden", "INTEGER DEFAULT 0"),
+    ("items", "manual_verdict", "TEXT"),
+    ("items", "manual_note", "TEXT"),
+    ("items", "manual_at", "TEXT"),
 ]
+
+MANUAL_VERDICTS = ("conforme", "incerto", "non_conforme")
 
 
 def now() -> str:
@@ -161,8 +171,38 @@ class DB:
         self.conn.execute("UPDATE items SET notified=1 WHERE hunt=? AND legacy_id=?", (hunt, legacy_id))
         self.conn.commit()
 
+    # --- interventi manuali (interfaccia web) ------------------------
+    def _update_many(self, hunt: str, ids: list[str], sql_set: str, args: tuple) -> int:
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self.conn.execute(f"UPDATE items SET {sql_set} WHERE hunt=? AND legacy_id IN ({marks})",
+                                (*args, hunt, *ids))
+        self.conn.commit()
+        return cur.rowcount
+
+    def set_hidden(self, hunt: str, ids: list[str], hidden: bool) -> int:
+        return self._update_many(hunt, ids, "hidden=?", (int(hidden),))
+
+    def set_manual(self, hunt: str, ids: list[str], verdict: str | None, note: str = "") -> int:
+        """Esito dell'operatore; None lo toglie e torna a valere quello del modello."""
+        if verdict is not None and verdict not in MANUAL_VERDICTS:
+            raise ValueError(f"esito non valido: {verdict}")
+        if verdict is None:
+            return self._update_many(hunt, ids, "manual_verdict=NULL, manual_note=NULL, manual_at=NULL", ())
+        return self._update_many(hunt, ids, "manual_verdict=?, manual_note=?, manual_at=?",
+                                 (verdict, note or None, now()))
+
+    def requeue(self, hunt: str, ids: list[str]) -> int:
+        """Rimette in coda per la verifica Groq al prossimo giro (anche se la scrematura aveva detto no)."""
+        return self._update_many(
+            hunt, ids,
+            """screen_verdict='si', screen_reason='rimesso in verifica a mano', verify_hash=NULL,
+               verify_total=NULL, verdict=NULL, score=NULL, verify_json=NULL,
+               manual_verdict=NULL, manual_note=NULL, manual_at=NULL""", ())
+
     def results(self, hunt: str, min_score: int = 0, limit: int = 50, include_unverified: bool = False):
-        where = "hunt=?"
+        where = "hunt=? AND COALESCE(hidden, 0)=0"
         args: list = [hunt]
         if not include_unverified:
             where += " AND score IS NOT NULL AND score >= ?"

@@ -1,7 +1,8 @@
-"""Interfaccia web in sola lettura sui risultati: python -m scovatore web.
+"""Interfaccia web sui risultati: python -m scovatore web.
 
-Solo libreria standard: nessuna dipendenza in piu' nel container. Legge lo stesso SQLite
-del servizio aprendolo in sola lettura, quindi puo' girare in parallelo al loop.
+Solo libreria standard: nessuna dipendenza in piu' nel container. Le pagine leggono il
+database in sola lettura; le azioni dell'operatore (elimina, correggi esito, riverifica)
+scrivono con transazioni brevi, quindi il servizio puo' girare in parallelo al loop.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from .config import Config
+from .db import DB, MANUAL_VERDICTS
 
 log = logging.getLogger(__name__)
 
@@ -26,8 +28,22 @@ ESITI = {
     "non_conforme": "Non conformi",
     "attesa": "In attesa di verifica",
     "scartati": "Scartati dalla scrematura",
+    "manuali": "Corretti a mano",
     "tutti": "Tutti",
+    "eliminati": "Eliminati",
 }
+# azione -> (etichetta, esito al singolare, esito al plurale)
+AZIONI = {
+    "conforme": ("Segna conforme", "segnato come conforme", "segnati come conformi"),
+    "incerto": ("Segna incerto", "segnato come incerto", "segnati come incerti"),
+    "non_conforme": ("Segna non conforme", "segnato come non conforme", "segnati come non conformi"),
+    "annulla": ("Togli correzione", "riportato al giudizio del modello", "riportati al giudizio del modello"),
+    "riverifica": ("Rimetti in verifica", "rimesso in verifica per il prossimo giro",
+                   "rimessi in verifica per il prossimo giro"),
+    "elimina": ("Elimina", "eliminato", "eliminati"),
+    "ripristina": ("Ripristina", "ripristinato", "ripristinati"),
+}
+EFF = "COALESCE(manual_verdict, verdict)"   # esito effettivo: l'operatore prevale sul modello
 ORDINI = {"punteggio": "Punteggio", "prezzo": "Prezzo", "recenti": "Più recenti"}
 LIMIT = 300
 
@@ -46,12 +62,14 @@ def connect(db_path: Path) -> sqlite3.Connection | None:
 def hunts_overview(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """SELECT hunt,
-                  COUNT(*) AS totale,
-                  SUM(score IS NOT NULL) AS verificati,
-                  SUM(verdict = 'conforme') AS conformi,
-                  SUM(screen_verdict IS NOT NULL AND screen_verdict != 'no' AND score IS NULL) AS attesa,
+                  SUM(hidden = 0) AS totale,
+                  SUM(hidden = 0 AND (score IS NOT NULL OR manual_verdict IS NOT NULL)) AS verificati,
+                  SUM(hidden = 0 AND {EFF} = 'conforme') AS conformi,
+                  SUM(hidden = 0 AND manual_verdict IS NULL AND score IS NULL
+                      AND screen_verdict IS NOT NULL AND screen_verdict != 'no') AS attesa,
+                  SUM(hidden = 1) AS eliminati,
                   MAX(first_seen) AS ultimo_nuovo
-           FROM items GROUP BY hunt ORDER BY hunt""").fetchall()
+           FROM items GROUP BY hunt ORDER BY hunt""".replace("{EFF}", EFF)).fetchall()
     out = [dict(r) for r in rows]
     for h in out:
         h["ultimo_giro"] = last_run(conn, h["hunt"])
@@ -80,19 +98,22 @@ def countries(conn: sqlite3.Connection, hunt: str) -> list[str]:
 
 def query_items(conn: sqlite3.Connection, hunt: str, esito: str = "verificati", min_score: int = 0,
                 paese: str = "", ordina: str = "punteggio", giorni: int = 0) -> list[sqlite3.Row]:
-    where = ["hunt = ?"]
+    where = ["hunt = ?", "hidden = 1" if esito == "eliminati" else "hidden = 0"]
     args: list = [hunt]
     if esito == "verificati":
-        where.append("score IS NOT NULL")
-    elif esito in ("conforme", "incerto", "non_conforme"):
-        where.append("verdict = ?")
+        where.append("(score IS NOT NULL OR manual_verdict IS NOT NULL)")
+    elif esito in MANUAL_VERDICTS:
+        where.append(f"{EFF} = ?")
         args.append(esito)
     elif esito == "attesa":
-        where.append("score IS NULL AND (screen_verdict IS NULL OR screen_verdict != 'no')")
+        where.append("score IS NULL AND manual_verdict IS NULL AND (screen_verdict IS NULL OR screen_verdict != 'no')")
     elif esito == "scartati":
-        where.append("screen_verdict = 'no'")
-    if min_score and esito not in ("attesa", "scartati"):
-        where.append("COALESCE(score, -1) >= ?")
+        where.append("screen_verdict = 'no' AND manual_verdict IS NULL")
+    elif esito == "manuali":
+        where.append("manual_verdict IS NOT NULL")
+    if min_score and esito not in ("attesa", "scartati", "eliminati"):
+        # il punteggio e' del modello; un conforme deciso dall'operatore passa comunque
+        where.append("(COALESCE(score, -1) >= ? OR manual_verdict = 'conforme')")
         args.append(min_score)
     if paese:
         where.append("country = ?")
@@ -104,7 +125,8 @@ def query_items(conn: sqlite3.Connection, hunt: str, esito: str = "verificati", 
     order = {
         "prezzo": "total ASC",
         "recenti": "first_seen DESC",
-    }.get(ordina, "score IS NULL, score DESC, total ASC")
+    }.get(ordina, f"COALESCE({EFF}, '') = 'non_conforme', COALESCE({EFF}, '') = 'conforme' DESC, "
+                  "score IS NULL, score DESC, total ASC")
     return conn.execute(f"SELECT * FROM items WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
                         (*args, LIMIT)).fetchall()
 
@@ -188,9 +210,36 @@ ul.small{margin:4px 0 0 18px;padding:0;font-size:13px}
 .nums span{font-size:12px;color:var(--muted)}.err{color:var(--lo);font-size:13px}
 .empty{padding:30px;text-align:center;color:var(--muted)}
 .scroll{overflow-x:auto}
+.thumbcol{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.item.manual{border-left:3px solid var(--accent)}
+.chip.man{background:var(--accent);color:var(--card)}
+.acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+button.act{font-size:12px;padding:3px 9px;background:var(--chip);color:var(--ink);border:1px solid var(--line)}
+button.act.on{background:var(--accent);color:var(--card);border-color:var(--accent)}
+button.act.danger{color:var(--lo)}
+.bulk{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--card);
+border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:12px}
+.bulk .all{font-size:13px;display:flex;gap:5px;align-items:center}
+.bulk input[type=text]{flex:1;min-width:140px}
+.flash{background:var(--chip);border-left:3px solid var(--hi);padding:8px 12px;border-radius:6px;margin-bottom:12px}
 @media (max-width:640px){.item{grid-template-columns:64px 1fr}.thumb{width:64px;height:64px}
 .right{grid-column:1/-1;text-align:left;display:flex;gap:12px;align-items:center}}
 """
+
+
+JS = """<script>
+(function(){var all=document.getElementById('selall');if(!all)return;
+var boxes=function(){return document.querySelectorAll('input.sel')};
+var upd=function(){var n=0;boxes().forEach(function(b){if(b.checked)n++});
+document.getElementById('nsel').textContent=n+' selezionat'+(n==1?'o':'i')};
+all.addEventListener('change',function(){boxes().forEach(function(b){b.checked=all.checked});upd()});
+document.addEventListener('change',function(ev){if(ev.target.classList.contains('sel'))upd()});
+document.getElementById('lista').addEventListener('submit',function(ev){
+var b=ev.submitter;if(!b||b.name!=='multipla')return;var n=0;boxes().forEach(function(x){if(x.checked)n++});
+if(!n){alert('Nessun annuncio selezionato');ev.preventDefault();return}
+var a=this.querySelector('select[name=azione_multipla]').value;
+if(a==='elimina'&&!confirm('Eliminare '+n+' annunci dalla caccia?'))ev.preventDefault()});})();
+</script>"""
 
 
 def page(title: str, body: str, hunts: list[str], current: str = "") -> str:
@@ -226,6 +275,7 @@ def render_home(conn) -> tuple[str, list[str]]:
 <h2>{e(h['hunt'])}</h2><div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
 <div><b>{h['verificati'] or 0}</b><span>verificati</span></div><div><b>{h['attesa'] or 0}</b><span>in attesa</span></div>
 <div><b>{h['totale']}</b><span>visti</span></div></div>
+{f'<div class="meta">{h["eliminati"]} eliminati a mano</div>' if h.get("eliminati") else ''}
 <div class="meta">{e(run_line)} · ultimo annuncio nuovo {e(ago(h['ultimo_nuovo']))}</div>{err}</a>""")
     return f'<h1>Cacce</h1><div class="cards">{"".join(cards)}</div>', names
 
@@ -251,6 +301,12 @@ def _list(title: str, items) -> str:
         "".join(f"<li>{e(i)}</li>" for i in items) + "</ul>"
 
 
+def _btn(azione: str, lid: str, label: str, cls: str = "") -> str:
+    confirm = ' onclick="return confirm(\'Eliminare questo annuncio dalla caccia?\')"' if azione == "elimina" else ""
+    return (f'<button class="act {cls}" name="azione" value="{e(azione)}:{e(lid)}"{confirm}>'
+            f'{e(label)}</button>')
+
+
 def render_item(r: sqlite3.Row) -> str:
     keys = r.keys()
     v = json.loads(r["verify_json"] or "{}")
@@ -264,23 +320,43 @@ def render_item(r: sqlite3.Row) -> str:
         chips.append(r["condition"])
     chip_html = "".join(f'<span class="chip">{e(c)}</span>' for c in chips if c)
     ship = "spedizione ?" if r["shipping"] is None else f"+ {money(r['shipping'])} sped."
-    esito = (r["verdict"] or ("scartato" if r["screen_verdict"] == "no" else "da verificare")).replace("_", " ")
+    manual = r["manual_verdict"] if "manual_verdict" in keys else None
+    hidden = bool(r["hidden"]) if "hidden" in keys else False
+    model_esito = r["verdict"] or ("scartato" if r["screen_verdict"] == "no" else "da verificare")
+    esito = (manual or model_esito).replace("_", " ")
+    lid = r["legacy_id"]
     sintesi = v.get("sintesi") or (r["screen_reason"] if r["screen_verdict"] == "no" else "")
     detail = _req_rows(v) + _list("Segnali di rischio", v.get("segnali_rischio")) + \
         _list("Domande al venditore", v.get("domande_al_venditore"))
     if r["screen_verdict"]:
         detail += f"<div class='meta' style='margin-top:8px'>Scrematura: {e(r['screen_verdict'])}" + \
             (f", {e(r['screen_reason'])}" if r["screen_reason"] else "") + "</div>"
+    if manual:
+        detail += (f"<div class='meta' style='margin-top:8px'>Correzione manuale {e(ago(r['manual_at']))}: "
+                   f"{e(manual.replace('_', ' '))} (il modello diceva: {e(model_esito.replace('_', ' '))}"
+                   f"{'' if r['score'] is None else ', ' + str(r['score'])})"
+                   f"{' · nota: ' + e(r['manual_note']) if r['manual_note'] else ''}</div>")
     detail += (f"<div class='meta'>Visto la prima volta {e(ago(r['first_seen']))}, l'ultima {e(ago(r['last_seen']))}"
                f" · venditore {e(r['seller'])} · ID {e(r['legacy_id'])}</div>")
-    return f"""<div class="item">{thumb}<div>
+    if hidden:
+        actions = _btn("ripristina", lid, "Ripristina")
+    else:
+        actions = "".join(_btn(a, lid, lbl, "on" if manual == a else "")
+                          for a, lbl in (("conforme", "Conforme"), ("incerto", "Incerto"),
+                                         ("non_conforme", "Non conforme")))
+        if manual:
+            actions += _btn("annulla", lid, "Togli correzione")
+        actions += _btn("riverifica", lid, "Riverifica") + _btn("elimina", lid, "Elimina", "danger")
+    badge = '<span class="chip man">a mano</span>' if manual else ""
+    return f"""<div class="item{' manual' if manual else ''}"><div class="thumbcol">
+<input type="checkbox" class="sel" name="id" value="{e(lid)}" aria-label="seleziona">{thumb}</div><div>
 <a class="title" href="{e(r['url'])}" target="_blank" rel="noopener">{e(r['title'])}</a>
 <div class="meta">{chip_html}{' · visto ' + e(ago(r['first_seen']))}</div>
 {f'<div class="sintesi">{e(sintesi)}</div>' if sintesi else ''}
-<details><summary>Dettagli</summary>{detail}</details></div>
+<details><summary>Dettagli</summary>{detail}</details><div class="acts">{actions}</div></div>
 <div class="right"><div class="score {score_class(r['score'])}">{'-' if r['score'] is None else r['score']}</div>
 <div class="price">{money(r['total'], r['currency'])}</div><div class="meta">{money(r['price'])} {e(ship)}</div>
-<div class="meta">{e(esito)}</div></div></div>"""
+<div class="meta">{badge}{e(esito)}</div></div></div>"""
 
 
 def render_hunt(conn, hunt: str, q: dict) -> str:
@@ -321,7 +397,17 @@ def render_hunt(conn, hunt: str, q: dict) -> str:
 <button>Filtra</button></form>"""
     items = "".join(render_item(x) for x in rows) or '<div class="empty">Nessun annuncio con questi filtri.</div>'
     more = f'<p class="meta">Mostrati i primi {LIMIT}.</p>' if len(rows) >= LIMIT else ""
-    return f"<h1>{e(hunt)}</h1><p class='sub'>{e(sub)} · {len(rows)} annunci</p>{form}{items}{more}"
+    msg = f'<div class="flash">{e(q["msg"])}</div>' if q.get("msg") else ""
+    back = urlencode({k: v for k, v in q.items() if k not in ("msg", "token")})
+    bulk_opts = [a for a in AZIONI if (a == "ripristina") == (esito == "eliminati")]
+    bulk = f"""<div class="bulk"><label class="all"><input type="checkbox" id="selall"> tutti</label>
+<span id="nsel" class="meta">0 selezionati</span>
+<select name="azione_multipla">{"".join(f'<option value="{a}">{e(AZIONI[a][0])}</option>' for a in bulk_opts)}</select>
+<input type="text" name="nota" placeholder="nota (facoltativa)" maxlength="300">
+<button name="multipla" value="1">Applica ai selezionati</button></div>"""
+    actions_form = (f'<form method="post" action="/caccia/{quote(hunt)}/azioni" id="lista">'
+                    f'<input type="hidden" name="back" value="{e(back)}">{bulk if rows else ""}{items}</form>')
+    return f"<h1>{e(hunt)}</h1><p class='sub'>{e(sub)} · {len(rows)} annunci</p>{msg}{form}{actions_form}{more}{JS}"
 
 
 def render_runs(conn) -> str:
@@ -347,6 +433,38 @@ def render_runs(conn) -> str:
 <div class="scroll"><table><tr><th>#</th><th>Caccia</th><th>Avvio</th><th>Stato</th><th>Durata</th><th>Ricerche</th>
 <th>Unici</th><th>Scartati</th><th>Nuovi</th><th>Scremati</th><th>Verificati</th><th>Conformi</th><th>eBay</th>
 <th>Errori</th></tr>{''.join(rows)}</table></div>"""
+
+
+def apply_action(db_path: Path, hunt: str, form: dict[str, list[str]]) -> str:
+    """Esegue un'azione dell'operatore e restituisce il messaggio da mostrare."""
+    single = (form.get("azione") or [""])[-1]
+    if single and ":" in single:
+        azione, lid = single.split(":", 1)
+        ids = [lid]
+    else:
+        azione = (form.get("azione_multipla") or [""])[-1]
+        ids = form.get("id") or []
+    ids = [i for i in dict.fromkeys(ids) if i and i.isdigit()][:1000]   # gli ID legacy sono numerici
+    if azione not in AZIONI:
+        return "Azione non riconosciuta."
+    if not ids:
+        return "Nessun annuncio selezionato."
+    note = (form.get("nota") or [""])[-1].strip()[:300]
+    db = DB(db_path)
+    try:
+        if azione in MANUAL_VERDICTS:
+            n = db.set_manual(hunt, ids, azione, note)
+        elif azione == "annulla":
+            n = db.set_manual(hunt, ids, None)
+        elif azione == "riverifica":
+            n = db.requeue(hunt, ids)
+        else:
+            n = db.set_hidden(hunt, ids, azione == "elimina")
+    finally:
+        db.close()
+    log.info("web: %s su %d annunci di %s (%s)%s", azione, n, hunt, ",".join(ids[:10]),
+             f", nota: {note}" if note else "")
+    return f"{n} annuncio {AZIONI[azione][1]}." if n == 1 else f"{n} annunci {AZIONI[azione][2]}."
 
 
 def api_items(conn, hunt: str, q: dict) -> list[dict]:
@@ -388,6 +506,33 @@ def make_handler(cfg: Config):
                 return "set"
             c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
             return "scovatore_token" in c and c["scovatore_token"].value == cfg.web_token
+
+        def _same_origin(self) -> bool:
+            """Blocca form inviati da altri siti (CSRF): Origin o Referer devono puntare a questo host."""
+            src = self.headers.get("Origin") or self.headers.get("Referer")
+            if not src:
+                return True
+            return urlparse(src).netloc == self.headers.get("Host", "")
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if not self._authorized({}) or not self._same_origin():
+                return self._send(403, page("Accesso", '<div class="empty">Azione non consentita.</div>', []))
+            parts = [p for p in u.path.split("/") if p]
+            if len(parts) != 3 or parts[0] != "caccia" or parts[2] != "azioni":
+                return self._send(404, "non trovato", "text/plain")
+            hunt = parts[1]
+            length = min(int(self.headers.get("Content-Length") or 0), 200_000)
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+            try:
+                msg = apply_action(cfg.db_path, hunt, form)
+            except Exception as exc:
+                log.exception("azione web fallita su %s", hunt)
+                msg = f"Errore: {exc}"
+            back = dict(parse_qs((form.get("back") or [""])[-1]))
+            q = {k: v[-1] for k, v in back.items()}
+            q["msg"] = msg
+            return self._send(303, "", extra={"Location": f"/caccia/{quote(hunt)}?{urlencode(q)}"})
 
         def do_GET(self):
             u = urlparse(self.path)
@@ -437,6 +582,7 @@ def make_handler(cfg: Config):
 def serve(cfg: Config, host: str | None = None, port: int | None = None) -> None:
     host = host or cfg.web_host
     port = port or cfg.web_port
+    DB(cfg.db_path).close()   # crea il DB o aggiunge le colonne nuove prima di servire le pagine
     httpd = ThreadingHTTPServer((host, port), make_handler(cfg))
     log.info("interfaccia web su http://%s:%d (DB %s, token %s)", host, port, cfg.db_path,
              "attivo" if cfg.web_token else "disattivato")

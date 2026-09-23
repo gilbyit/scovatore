@@ -419,3 +419,70 @@ def test_web_token(env, monkeypatch):
             assert c.get("/giri").status_code == 200      # cookie impostato
     finally:
         srv.shutdown()
+
+
+# ---------------------------------------------------------------- piano: Palantir o Groq, query generiche
+from scovatore.pipeline import get_plan, is_generic_query, pick_planner, plan_note  # noqa: E402
+
+
+def test_generic_queries_are_dropped():
+    assert is_generic_query("non funzionante")
+    assert is_generic_query("Defekt für Bastler")
+    assert is_generic_query("for parts / not working")
+    assert not is_generic_query("amplificatore non funzionante")
+    assert not is_generic_query("verstärker defekt")
+    plan = normalize_plan({"query": {"it": ["non funzionante", "amplificatore guasto", "guasto"],
+                                     "en": ["for parts", "amplifier for parts"]}}, ["it", "en"], 4)
+    assert plan["query"] == {"it": ["amplificatore guasto"], "en": ["amplifier for parts"]}
+    assert len(plan["scartate"]) == 3
+
+
+def test_plan_note_tells_condition_is_filtered():
+    h = parse_hunt({"ricerca": "ampli", "ebay": {"condizioni": ["guasto"]}})
+    assert "ricambi" in plan_note(h)
+    assert "funzionanti" in plan_note(parse_hunt(HUNT))
+    assert plan_note(parse_hunt({"ricerca": "x"})) == ""
+
+
+def test_plan_llm_setting(env, monkeypatch):
+    monkeypatch.setenv("SCOVATORE_PLAN_LLM", "groq")
+    cfg = load_config(env_file=str(env.data_dir / "nessuno.env"))
+    assert cfg.plan_llm == "groq"
+    monkeypatch.setenv("SCOVATORE_PLAN_LLM", "chatgpt")
+    with pytest.raises(ValueError):
+        load_config(env_file=str(env.data_dir / "nessuno.env"))
+
+
+def test_plan_generated_by_chosen_llm_and_cached_per_llm(env):
+    from dataclasses import replace
+    pal_fake, groq_fake = FakeLLM(), FakeLLM()
+    pal = LLMClient(env.palantir, transport=httpx.MockTransport(pal_fake))
+    groq = LLMClient(env.groq, transport=httpx.MockTransport(groq_fake))
+    db = DB(env.db_path)
+    h = parse_hunt(HUNT)
+
+    cfg_groq = replace(env, plan_llm="groq")
+    plan = get_plan(h, db, pick_planner(cfg_groq, pal, groq))
+    assert groq_fake.calls["plan"] == 1 and pal_fake.calls["plan"] == 0
+    assert plan["generato_da"].startswith("groq:")
+    get_plan(h, db, pick_planner(cfg_groq, pal, groq))          # dalla cache
+    assert groq_fake.calls["plan"] == 1
+
+    # cambiare modello invalida la cache: il piano di Groq non viene riusato per Palantir
+    plan = get_plan(h, db, pick_planner(env, pal, groq))
+    assert pal_fake.calls["plan"] == 1 and plan["generato_da"].startswith("palantir:")
+
+    # groq richiesto ma non configurato: ripiega su Palantir
+    assert pick_planner(cfg_groq, pal, None) is pal
+    assert pick_planner(env, None, groq) is groq
+
+
+def test_run_uses_groq_for_plan(env):
+    from dataclasses import replace
+    fake, pal_fake, groq_fake = FakeEbay(), FakeLLM(), FakeLLM()
+    ebay = EbayClient("app", "cert", env.ebay_api_base, "IT", "10100", 1000, transport=httpx.MockTransport(fake))
+    pal = LLMClient(env.palantir, transport=httpx.MockTransport(pal_fake))
+    groq = LLMClient(env.groq, transport=httpx.MockTransport(groq_fake))
+    run_hunt(parse_hunt(HUNT), replace(env, plan_llm="groq"), DB(env.db_path), ebay, pal, groq)
+    assert groq_fake.calls["plan"] == 1 and pal_fake.calls["plan"] == 0
+    assert pal_fake.calls["screen"] >= 1          # la scrematura resta a Palantir

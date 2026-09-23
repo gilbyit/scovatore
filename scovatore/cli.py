@@ -256,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--csv", help="scrivi anche un CSV")
     p.set_defaults(fn=cmd_risultati)
 
-    p = sub.add_parser("web", help="interfaccia web in sola lettura sui risultati")
+    p = sub.add_parser("web", help="interfaccia web sui risultati, con interventi manuali")
     p.add_argument("--host", help="default SCOVATORE_WEB_HOST (0.0.0.0)")
     p.add_argument("--porta", type=int, help="default SCOVATORE_WEB_PORT (8482)")
     p.set_defaults(fn=cmd_web)

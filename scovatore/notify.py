@@ -18,6 +18,7 @@ def notify(hunt: Hunt, db: DB, cfg: Config, transport: httpx.BaseTransport | Non
         return 0
     rows = db.conn.execute(
         """SELECT * FROM items WHERE hunt=? AND notified=0 AND verdict='conforme' AND score>=?
+           AND COALESCE(hidden, 0)=0 AND manual_verdict IS NULL
            ORDER BY score DESC""", (hunt.nome, cfg.notify_min_score)).fetchall()
     sent = 0
     headers_base = {}

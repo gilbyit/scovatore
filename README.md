@@ -113,14 +113,19 @@ python -m scovatore risultati ampli-guasto --tutti    # anche i non verificati
 
 ### Interfaccia web
 
-Il compose avvia anche `scovatore-web`, che legge lo stesso database in sola lettura:
+Il compose avvia anche `scovatore-web`, che lavora sullo stesso database del servizio:
 
 - `http://nasgul:8482/`: riepilogo delle cacce (conformi, verificati, in attesa, ultimo giro ed eventuali errori);
 - `/caccia/<nome>`: classifica filtrabile per esito, punteggio minimo, paese, periodo, con ordinamento per punteggio, prezzo o novità. Ogni annuncio ha il dettaglio della verifica (requisiti, fonte del dato, rischi, domande al venditore) e il motivo della scrematura;
+- **interventi manuali**, su un annuncio (pulsanti sotto la scheda) o su più annunci (caselle + barra in alto, con nota facoltativa):
+  - **Conforme / Incerto / Non conforme**: l'esito dell'operatore prevale su quello del modello, che resta visibile nel dettaglio ("il modello diceva: ..."). Groq non lo sovrascrive più, nemmeno se il prezzo cambia; **Togli correzione** torna al giudizio del modello;
+  - **Riverifica**: rimette l'annuncio in coda per Groq al prossimo giro, anche se la scrematura lo aveva scartato (serve che l'annuncio sia ancora online e ricompaia nelle ricerche);
+  - **Elimina**: toglie l'annuncio dalla caccia. Non viene cancellato dal DB, altrimenti eBay lo restituirebbe al giro dopo e ripartirebbero scrematura e verifica: resta marcato, la pipeline lo ignora e non lo notifica, e si ripristina dalla vista **Eliminati**;
+  - la vista **Corretti a mano** raccoglie gli interventi: è il materiale giusto per capire dove sbagliano i prompt;
 - `/giri`: gli ultimi giri di tutte le cacce con durata di ogni fase, contatori ed errori;
 - `/api/caccia/<nome>` e `/api/giri`: gli stessi dati in JSON (accettano gli stessi parametri della pagina), utili per GILPA.
 
-Senza `SCOVATORE_WEB_TOKEN` non c'è protezione: va bene finché la porta resta in LAN. Con il token impostato si apre una volta `http://nasgul:8482/?token=...` e il browser lo ricorda. Da riga di comando: `python -m scovatore web [--porta 8482]`.
+Senza `SCOVATORE_WEB_TOKEN` non c'è protezione: va bene finché la porta resta in LAN (le azioni accettano solo form inviati dalla pagina stessa, non da altri siti). Con il token impostato si apre una volta `http://nasgul:8482/?token=...` e il browser lo ricorda. Da riga di comando: `python -m scovatore web [--porta 8482]`.
 
 ### Log
 
@@ -221,7 +226,7 @@ Ogni giro ricerca sempre su eBay, ma i passaggi LLM si ripetono solo quando serv
 - **piano**: in cache finché non cambiano `ricerca`, marketplace (lingue), `max_query_per_lingua`, condizioni, il modello che lo genera o il prompt. Forzabile con `--rigenera` / `--rigenera-piano`;
 - **scrematura**: una volta per annuncio;
 - **verifica Groq**: una volta per annuncio, ripetuta se cambiano `ricerca`, `requisiti_avanzati` o `dati_riferimento`, oppure se il prezzo totale si muove di oltre il 5% (aste, ribassi);
-- **notifica**: una volta per annuncio.
+- **notifica**: una volta per annuncio, mai per quelli eliminati o corretti a mano.
 
 Per ogni giro la verifica tocca al massimo `SCOVATORE_MAX_VERIFY_PER_RUN` annunci, prima i "si" poi i "forse", dal più economico. Gli altri restano per il giro successivo. Con 8000 token al minuto e circa 1500-2500 token per verifica, 25 annunci richiedono qualche minuto di attesa.
 
@@ -266,7 +271,7 @@ scovatore/
   pipeline.py   orchestrazione di un giro
   db.py         SQLite: piani, esecuzioni, annunci, verdetti
   notify.py     ntfy
-  web.py        interfaccia web in sola lettura (solo libreria standard)
+  web.py        interfaccia web con interventi manuali (solo libreria standard)
   cli.py        comandi
 cacce/          definizioni delle cacce
 dati/           dati di riferimento per Groq

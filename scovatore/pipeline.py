@@ -30,6 +30,7 @@ class RunStats:
     scartati_filtri: int = 0
     scartati_paese: int = 0
     ricerche_saltate: int = 0
+    eliminati_a_mano: int = 0
     nuovi: int = 0
     scremati: int = 0
     scremati_no: int = 0
@@ -424,9 +425,14 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
                 continue
             if db.upsert_seen(hunt.nome, l):
                 stats.nuovi += 1
+            if db.get_item(hunt.nome, l.legacy_id)["hidden"]:
+                stats.eliminati_a_mano += 1   # eliminato dall'operatore: si aggiorna solo last_seen
+                continue
             kept.append(l)
         log.info("[%s] filtri locali: tenuti %d, scartati %d %s; nuovi mai visti %d", hunt.nome, len(kept),
                  stats.scartati_filtri, dict(reasons.most_common()) if reasons else "", stats.nuovi)
+        if stats.eliminati_a_mano:
+            log.info("[%s] %d annunci ignorati perche' eliminati a mano", hunt.nome, stats.eliminati_a_mano)
 
         # scrematura solo per chi non e' mai stato scremato
         to_screen = [l for l in kept if (db.get_item(hunt.nome, l.legacy_id)["screen_verdict"] is None)]
@@ -448,6 +454,9 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
         for l in kept:
             row = db.get_item(hunt.nome, l.legacy_id)
             if row["screen_verdict"] == "no":
+                continue
+            if row["manual_verdict"]:
+                already += 1          # deciso dall'operatore: Groq non lo sovrascrive
                 continue
             if needs_verify(row, hunt, l.total):
                 cands.append((SCREEN_ORDER.get(row["screen_verdict"], 2), l.total, l))

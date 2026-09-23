@@ -16,7 +16,8 @@ services:
     networks:
       - palantir
 
-  # Interfaccia web in sola lettura sui risultati: http://<nasgul>:8482
+  # Interfaccia web sui risultati, con interventi manuali: http://<nasgul>:8482
+  # data/ deve restare scrivibile: elimina e correzioni finiscono nel DB
   scovatore-web:
     build: .
     container_name: scovatore-web
