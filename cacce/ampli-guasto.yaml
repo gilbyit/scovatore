@@ -1,4 +1,5 @@
 # Caccia: amplificatore audio guasto di buona marca, con guasto probabile in alimentazione.
+# Preferenza per apparecchi fino agli anni 80, spedizione massima 15 euro.
 
 nome: ampli-guasto
 attiva: true
@@ -11,6 +12,7 @@ ebay:
   valuta: EUR
   prezzo_max: 150               # da regolare
   spedizione_inclusa: true
+  spedizione_max: 15            # oltre 15 euro di spedizione verso l'Italia l'annuncio si scarta
   regione: EUROPEAN_UNION
   consegna_paese: IT
   condizioni: [guasto]          # conditionId 7000: "per ricambi o non funzionante"
@@ -21,8 +23,8 @@ ebay:
 lingue: ue                      # it en de fr es nl pl
 
 ricerca: >
-  Amplificatore audio hi-fi (integrato, finale o ricevitore stereo) guasto o non funzionante,
-  venduto per ricambi o da riparare.
+  Amplificatore audio hi-fi vintage (integrato, finale o ricevitore stereo), preferibilmente
+  degli anni 70 o 80, guasto o non funzionante, venduto per ricambi o da riparare.
 
 # Attenzione: sono parole che, da sole nel titolo, indicano l'oggetto sbagliato.
 # "telecomando" da solo escluderebbe anche "amplificatore con telecomando".
@@ -31,6 +33,15 @@ parole_escluse: [solo telecomando, only remote, nur fernbedienung, service manua
 screening: true
 
 requisiti_avanzati: |
+  - Spedizione verso l'Italia: se costa piu' di 15 euro scarta l'annuncio, qualunque sia il prezzo.
+    Se il costo di spedizione non e' indicato o e' "da concordare", segnalalo come incerto.
+  - Epoca: preferiti gli apparecchi prodotti fino alla fine degli anni 80 (componenti discreti,
+    schemi reperibili, riparabili). Deduci l'anno dal modello se il titolo non lo dice.
+    * anni 70 e 80: favorevole.
+    * anni 90 e successivi: sfavorevole (piu' integrazione, microcontrollori, SMD, ricambi dedicati).
+      Tienili solo se il resto e' molto favorevole e segnalalo.
+    * finali a modulo ibrido (es. serie STK) anche se anni 70-80: segnalalo, i ricambi originali sono difficili.
+    Riporta l'epoca stimata nel campo valore del requisito.
   - Marca e modello di buona reputazione e qualita' costruttiva (hi-fi di fascia media o alta,
     non prodotti economici da supermercato o mini impianti).
   - I sintomi dichiarati devono far pensare a un guasto di alimentazione e NON allo stadio finale.
