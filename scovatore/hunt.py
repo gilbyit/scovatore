@@ -241,4 +241,11 @@ def load_hunt(path: str | Path) -> Hunt:
 
 
 def load_all(hunts_dir: Path) -> list[Hunt]:
-    return [load_hunt(p) for p in sorted(hunts_dir.glob("*.y*ml"))]
+    hunts: list[Hunt] = []
+    for p in sorted(hunts_dir.glob("*.y*ml")):
+        try:
+            hunts.append(load_hunt(p))
+        except Exception:
+            log.exception("caccia %s non caricata, la salto", p.name)
+    return hunts
+    
