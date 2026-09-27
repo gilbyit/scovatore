@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+log = logging.getLogger("scovatore")
+
 # Alias leggibili per conditionIds. Gli ID validi dipendono dalla categoria:
 # per l'elettronica sono tipici 1000, 1500, 2000-2500, 3000, 7000.
 CONDITION_ALIASES: dict[str, list[int]] = {
