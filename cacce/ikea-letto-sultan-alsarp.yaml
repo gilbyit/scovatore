@@ -1,0 +1,56 @@
+nome: ikea-letto-sultan-alsarp
+attiva: true
+ogni_minuti: 240
+
+ebay:
+  marketplaces: [EBAY_IT]
+  valuta: EUR
+  regione: null                   # esplicito: non lasciare il default EUROPEAN_UNION, uso paese
+  paese: IT
+  consegna_paese: IT
+  spedizione_ignota: tieni        # mobili pesanti: quasi sempre solo ritiro
+  ordinamento: newlyListed
+  max_risultati_per_query: 100
+
+ricerca: >
+  Struttura letto IKEA "Sultan Alsarp" (linea Sultan, ormai fuori
+  produzione, venduta solo usata), misura matrimoniale 160x200 cm, con
+  contenitore/cassettone sotto la rete. Il materasso, se incluso
+  nell'annuncio, e' un bonus ma non e' l'oggetto della ricerca. Va bene
+  anche se l'annuncio scrive solo "Sultan" senza specificare "Alsarp",
+  purche' dalla descrizione o dalle foto si capisca che e' la versione
+  matrimoniale con contenitore (non un letto singolo, non una piazza e
+  mezza, non una struttura senza contenitore).
+
+query_extra:
+  - "ikea sultan alsarp letto matrimoniale"
+  - "ikea sultan alsarp contenitore"
+  - "letto contenitore ikea sultan matrimoniale"
+
+max_query_per_lingua: 4
+
+parole_escluse:
+  - singolo
+  - "una piazza"
+  - "piazza e mezza"
+  - 90x200
+  - 120x200
+  - 140x200
+
+screening: true
+
+requisiti_avanzati: |
+  Requisiti eliminatori (altrimenti esito non_conforme):
+  - Deve essere un letto IKEA della linea Sultan con struttura contenitore (cassettone sotto la rete apribile), non un letto Sultan senza contenitore e non un'altra linea IKEA (Malm, Brimnes, Nordli, Mandal...). Se il modello non e' identificabile con certezza ma sembra plausibile, esito incerto.
+  - Deve essere misura matrimoniale, 160x200 cm. Escludere singolo, piazza e mezza, king size, a meno che l'annuncio non sia ambiguo, nel qual caso incerto.
+  - L'annuncio deve indicare o lasciar intendere una zona di ritiro in Piemonte, idealmente Torino e provincia (esempi: Torino, Moncalieri, Rivoli, Collegno, Grugliasco, Nichelino, Chieri, Settimo Torinese, Venaria, Orbassano, Ivrea, Chivasso, Pinerolo). Se il venditore e' altrove in Italia ma dichiara di poter consegnare o l'acquirente puo' ritirare comodamente, indicarlo comunque con punteggio piu' basso; se e' fuori Piemonte senza alcuna disponibilita' di trasporto, non_conforme.
+
+  Punteggio (su 100):
+  - Corrispondenza al modello Sultan Alsarp matrimoniale con contenitore: 40 punti.
+  - Vicinanza a Torino: 30 punti, massimo se in citta' o cintura, in calo con la distanza dentro il Piemonte.
+  - Stato dichiarato (assenza di cigolii, meccanismo di apertura funzionante, legno/tessuto non rovinato, presenza di materasso se dichiarato) e chiarezza delle foto: 20 punti.
+  - Prezzo, in rapporto alla scarsita' del modello: 10 punti, senza scartare prezzi alti se il pezzo e' raro e in buono stato.
+
+  Segnali di rischio da riportare: meccanismo di sollevamento del contenitore rotto o rigido, cigolii della rete, macchie o odori sul tessuto della testiera, foto scarse o mancanti del vano contenitore, smontaggio/trasporto a carico dell'acquirente su un pezzo pesante e ingombrante.
+
+  Nella sintesi indicare: citta' o zona del venditore e distanza approssimativa da Torino, se il materasso e' incluso, stato dichiarato del meccanismo contenitore, prezzo e se e' trattabile. Domande utili per il venditore: il meccanismo di apertura funziona senza sforzo? Ci sono segni di umidita' o tarli? E' possibile visionarlo in zona Torino prima dell'acquisto?
