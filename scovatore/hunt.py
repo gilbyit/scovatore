@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+import logging
 
 log = logging.getLogger("scovatore")
 
