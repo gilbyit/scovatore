@@ -86,6 +86,13 @@ class Config:
     # Chi genera il piano delle query: palantir | groq
     plan_llm: str = "palantir"
 
+    # Dominio dei link agli annunci (interfaccia e notifiche): lo stesso ID funziona su
+    # tutti i siti eBay, e su quello italiano sei gia' loggato e vedi la spedizione in Italia
+    link_domain: str = "ebay.it"
+
+    def item_link(self, legacy_id: str) -> str:
+        return f"https://www.{self.link_domain}/itm/{legacy_id}"
+
     @property
     def ebay_api_base(self) -> str:
         return "https://api.sandbox.ebay.com" if self.ebay_env == "sandbox" else "https://api.ebay.com"
@@ -146,6 +153,7 @@ def load_config(env_file: str | None = None) -> Config:
         web_port=_int("SCOVATORE_WEB_PORT", 8482),
         web_token=_str("SCOVATORE_WEB_TOKEN"),
         plan_llm=_plan_llm(),
+        link_domain=_str("SCOVATORE_LINK_DOMAIN", "ebay.it").lower().removeprefix("www.").strip("/") or "ebay.it",
     )
 
 

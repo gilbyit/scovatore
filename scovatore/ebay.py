@@ -47,6 +47,7 @@ class Listing:
     description: str = ""
     aspects: dict[str, str] = field(default_factory=dict)
     condition_description: str = ""
+    ships_to_buyer: bool | None = None   # dal dettaglio: None = non si sa
 
     @property
     def total(self) -> float:
@@ -138,6 +139,33 @@ def _shipping(options) -> float | None:
     return min(costs) if costs else None
 
 
+BROAD_REGIONS = {"WORLDWIDE", "EUROPE", "EUROPEAN_UNION", "EU"}
+
+
+def ships_to(body: dict, country: str) -> bool | None:
+    """Se il venditore spedisce nel paese dell'acquirente, dal dettaglio dell'annuncio.
+
+    Conservativo: False solo quando e' esplicito (paese o area escluso, oppure elenco di
+    paesi ammessi che non lo contiene); True se le opzioni di spedizione calcolate per il
+    nostro paese esistono o se l'area ammessa lo copre; None negli altri casi.
+    """
+    country = country.upper()
+    loc = body.get("shipToLocations") or {}
+    def ids(key):
+        return {(str(r.get("regionType", "")).upper(), str(r.get("regionId", "")).upper())
+                for r in loc.get(key) or [] if isinstance(r, dict)}
+    excl, incl = ids("regionExcluded"), ids("regionIncluded")
+    if ("COUNTRY", country) in excl or any(t == "WORLD_REGION" and i in BROAD_REGIONS for t, i in excl):
+        return False
+    if body.get("shippingOptions"):
+        return True
+    if any(t == "WORLDWIDE" or i in BROAD_REGIONS for t, i in incl) or ("COUNTRY", country) in incl:
+        return True
+    if incl and all(t == "COUNTRY" for t, _ in incl):
+        return False   # spedisce solo a un elenco di paesi e il nostro non c'e'
+    return None
+
+
 def parse_summary(raw: dict, marketplace: str, query: str) -> Listing:
     price_obj = raw.get("price") or raw.get("currentBidPrice") or {}
     if raw.get("currentBidPrice") and "FIXED_PRICE" not in (raw.get("buyingOptions") or []):
@@ -178,6 +206,7 @@ class EbayClient:
         if buyer_zip:
             ctx += f",zip={buyer_zip}"
         self.enduser_ctx = "contextualLocation=" + quote(ctx, safe="")
+        self.buyer_country = buyer_country
         self.call_budget = call_budget
         self.calls = 0
         self._token: str | None = None
@@ -276,4 +305,5 @@ class EbayClient:
         ship = _shipping(body.get("shippingOptions"))
         if ship is not None:
             listing.shipping = ship
+        listing.ships_to_buyer = ships_to(body, self.buyer_country)
         return listing

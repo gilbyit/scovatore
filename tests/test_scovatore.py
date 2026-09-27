@@ -150,7 +150,12 @@ def test_hunt_validation():
     with pytest.raises(HuntError):
         parse_hunt({**HUNT, "campo_sbagliato": 1})
     assert parse_hunt(HUNT).nome == "test-mobo"
-    assert parse_hunt(HUNT).languages() == ["de", "en", "it"]
+    # default: tutte le lingue UE; con lingue esplicite, quelle + la lingua dei marketplace + inglese
+    assert parse_hunt(HUNT).languages() == ["de", "en", "es", "fr", "it", "nl", "pl"]
+    assert parse_hunt({**HUNT, "lingue": ["it"]}).languages() == ["de", "en", "it"]
+    assert parse_hunt({"ricerca": "x", "lingue": "ue"}).languages() == sorted(["it", "en", "de", "fr", "es", "nl", "pl"])
+    with pytest.raises(HuntError):
+        parse_hunt({**HUNT, "lingue": ["klingon"]})
 
 
 def test_example_hunts_are_valid():
@@ -202,8 +207,8 @@ def test_pipeline_end_to_end(env):
 
     s = run_hunt(hunt, cfg, db, ebay, pal, groq)
 
-    # query: IT (1 dopo dedup) + EN su EBAY_IT, DE + EN su EBAY_DE
-    assert s.query == 4
+    # ogni marketplace lancia tutte le lingue del piano: it (1 dopo dedup) + de + en, su IT e DE
+    assert s.query == 6
     assert {mp for mp, _, _ in ef.searches} == {"EBAY_IT", "EBAY_DE"}
     assert s.unici == 6
     assert s.scartati_filtri == 3           # cooler, oltre budget, GBP
@@ -299,7 +304,7 @@ def test_marketplaces_ue_alias_and_default():
     h = parse_hunt({"ricerca": "x", "ebay": {"marketplaces": ["EBAY_GB", "ue", "ebay_it"]}})
     assert h.ebay.marketplaces[0] == "EBAY_GB" and h.ebay.marketplaces.count("EBAY_IT") == 1
     assert len(h.ebay.marketplaces) == 1 + len(EU_MARKETPLACES)
-    assert parse_hunt({"ricerca": "x"}).ebay.marketplaces == EU_MARKETPLACES
+    assert parse_hunt({"ricerca": "x"}).ebay.marketplaces == ["EBAY_IT"]   # default: solo ebay.it
     with pytest.raises(HuntError):
         parse_hunt({"ricerca": "x", "ebay": {"marketplaces": ["EBAY_LT"]}})
 
@@ -395,7 +400,7 @@ def test_web_pages(env):
             assert "Giri recenti" in c.get("/giri").text
             assert c.get("/caccia/inesistente").status_code == 404
             # niente HTML iniettato dai titoli
-            assert "<script>" not in page.text
+            assert "<script>x()" not in page.text
     finally:
         srv.shutdown()
 
@@ -486,3 +491,188 @@ def test_run_uses_groq_for_plan(env):
     run_hunt(parse_hunt(HUNT), replace(env, plan_llm="groq"), DB(env.db_path), ebay, pal, groq)
     assert groq_fake.calls["plan"] == 1 and pal_fake.calls["plan"] == 0
     assert pal_fake.calls["screen"] >= 1          # la scrematura resta a Palantir
+
+
+# ---------------------------------------------------------------- interventi dell'operatore
+def _web(cfg):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from scovatore.web import make_handler
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cfg))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def _row(cfg, lid):
+    db = DB(cfg.db_path)
+    try:
+        return dict(db.get_item("test-mobo", lid))
+    finally:
+        db.close()
+
+
+def test_web_actions(env):
+    _seeded_db(env)          # 1 conforme (85), 2 incerto (40), 5 scartato dalla scrematura
+    srv, base = _web(env)
+    try:
+        with httpx.Client(base_url=base) as c:
+            # correzione singola: il 2 era incerto per il modello, l'operatore dice conforme
+            r = c.post("/caccia/test-mobo/azioni", data={"azione": "conforme:2", "back": "esito=tutti&min=0"})
+            assert r.status_code == 303
+            loc = r.headers["location"]
+            assert loc.startswith("/caccia/test-mobo?") and "esito=tutti" in loc and "msg=" in loc
+            row = _row(env, "2")
+            assert row["manual_verdict"] == "conforme" and row["verdict"] == "incerto"   # il modello resta visibile
+            page = c.get(loc).text
+            assert "1 annuncio segnato come conforme" in page and "il modello diceva: incerto" in page
+            assert "Gigabyte" in c.get("/caccia/test-mobo", params={"esito": "manuali"}).text
+            assert "Gigabyte" in c.get("/caccia/test-mobo", params={"esito": "conforme"}).text
+
+            # eliminazione multipla, con nota
+            r = c.post("/caccia/test-mobo/azioni", data={"multipla": "1", "azione_multipla": "elimina",
+                                                         "id": ["1", "5"], "nota": "doppioni"})
+            assert _row(env, "1")["hidden"] == 1 and _row(env, "5")["hidden"] == 1
+            tutti = c.get("/caccia/test-mobo", params={"esito": "tutti"}).text
+            assert "Xeon E5-1650" not in tutti and "Custodia" not in tutti
+            elim = c.get("/caccia/test-mobo", params={"esito": "eliminati"}).text
+            assert "Xeon E5-1650" in elim and "Ripristina" in elim
+            assert "2 eliminati a mano" in c.get("/").text
+
+            c.post("/caccia/test-mobo/azioni", data={"azione": "ripristina:1"})
+            assert _row(env, "1")["hidden"] == 0
+
+            # riverifica: anche uno scartato dalla scrematura torna in coda per Groq
+            c.post("/caccia/test-mobo/azioni", data={"azione": "riverifica:5"})
+            row = _row(env, "5")
+            assert row["screen_verdict"] == "si" and row["score"] is None and row["verify_hash"] is None
+
+            # togli correzione
+            c.post("/caccia/test-mobo/azioni", data={"azione": "annulla:2"})
+            assert _row(env, "2")["manual_verdict"] is None
+
+            # input sporco: azioni sconosciute, id non numerici, nessuna selezione, altra caccia
+            assert "non+riconosciuta" in c.post("/caccia/test-mobo/azioni",
+                                                data={"azione": "drop:1"}).headers["location"]
+            c.post("/caccia/test-mobo/azioni", data={"azione": "elimina:1 OR 1=1"})
+            assert _row(env, "1")["hidden"] == 0
+            assert "Nessun+annuncio" in c.post("/caccia/test-mobo/azioni",
+                                               data={"multipla": "1", "azione_multipla": "elimina"}).headers["location"]
+            c.post("/caccia/altra/azioni", data={"azione": "elimina:1"})
+            assert _row(env, "1")["hidden"] == 0
+
+            # form inviato da un altro sito: rifiutato
+            r = c.post("/caccia/test-mobo/azioni", data={"azione": "elimina:1"},
+                       headers={"Origin": "http://sito-cattivo.example"})
+            assert r.status_code == 403 and _row(env, "1")["hidden"] == 0
+    finally:
+        srv.shutdown()
+
+
+def test_pipeline_respects_operator(env, monkeypatch):
+    fake, llm = FakeEbay(), FakeLLM()
+    ebay, pal, groq = make_clients(env, fake, llm)
+    db = DB(env.db_path)
+    h = parse_hunt(HUNT)
+    run_hunt(h, env, db, ebay, pal, groq)
+    verifies = llm.calls["verify"]
+
+    db.set_manual(h.nome, ["1"], "non_conforme", "CPU sbagliata in foto")
+    db.set_hidden(h.nome, ["2"], True)
+    # prezzi cambiati del 20%: senza l'operatore entrambi verrebbero riverificati
+    for it in CATALOG[:2]:
+        it["price"]["value"] = str(float(it["price"]["value"]) * 0.8)
+    try:
+        stats = run_hunt(h, env, db, ebay, pal, groq)
+    finally:
+        CATALOG[0]["price"]["value"], CATALOG[1]["price"]["value"] = "80", "60"
+    assert llm.calls["verify"] == verifies            # nessuna nuova verifica
+    assert stats.eliminati_a_mano == 1
+    row = db.get_item(h.nome, "1")
+    assert row["manual_verdict"] == "non_conforme" and row["manual_note"] == "CPU sbagliata in foto"
+    assert db.get_item(h.nome, "2")["hidden"] == 1
+    assert all(r["legacy_id"] != "2" for r in db.results(h.nome, include_unverified=True))
+
+    # le notifiche ignorano eliminati e corretti a mano
+    from dataclasses import replace
+    from scovatore.notify import notify
+    sent = []
+    cfg = replace(env, ntfy_url="http://ntfy.local/t", notify_min_score=0)
+    db.conn.execute("UPDATE items SET notified=0, verdict='conforme', score=90 WHERE hunt=?", (h.nome,))
+    db.conn.commit()
+    notify(h, db, cfg, transport=httpx.MockTransport(lambda r: sent.append(r) or httpx.Response(200)))
+    notified = {r["legacy_id"] for r in db.conn.execute("SELECT legacy_id FROM items WHERE notified=1")}
+    assert "1" not in notified and "2" not in notified and len(sent) == len(notified)
+
+
+# ---------------------------------------------------------------- spedizione verso l'Italia e link
+from scovatore.ebay import ships_to  # noqa: E402
+from scovatore.pipeline import queries_for  # noqa: E402
+
+
+def test_ships_to():
+    assert ships_to({"shipToLocations": {"regionExcluded": [{"regionType": "COUNTRY", "regionId": "IT"}]}}, "IT") is False
+    assert ships_to({"shipToLocations": {"regionIncluded": [{"regionType": "COUNTRY", "regionId": "DE"},
+                                                            {"regionType": "COUNTRY", "regionId": "AT"}]}}, "IT") is False
+    assert ships_to({"shipToLocations": {"regionIncluded": [{"regionType": "WORLDWIDE", "regionId": "WORLDWIDE"}]}}, "IT")
+    assert ships_to({"shipToLocations": {"regionIncluded": [{"regionType": "WORLD_REGION", "regionId": "EUROPE"}]}}, "IT")
+    assert ships_to({"shippingOptions": [{"shippingCost": {"value": "9"}}]}, "IT") is True
+    assert ships_to({}, "IT") is None                           # nessun dato: non si scarta
+    # esclusione esplicita vince anche con opzioni di spedizione presenti
+    assert ships_to({"shippingOptions": [{}], "shipToLocations": {
+        "regionExcluded": [{"regionType": "COUNTRY", "regionId": "IT"}]}}, "IT") is False
+
+
+def test_unknown_shipping_from_abroad_is_dropped():
+    from scovatore.ebay import parse_summary
+    h = parse_hunt(HUNT)                            # default spedizione_ignota: scarta_estero
+    de = parse_summary(summary(20, "X79 bundle", 50, ship=None, country="DE"), "EBAY_IT", "q")
+    it = parse_summary(summary(21, "X79 bundle", 50, ship=None, country="IT"), "EBAY_IT", "q")
+    assert local_reject_reason(de, h, []).startswith("non spedisce in IT")
+    assert local_reject_reason(it, h, []) is None   # in Italia puo' essere ritiro a mano: si tiene
+    keep = parse_hunt({**HUNT, "ebay": {**HUNT["ebay"], "spedizione_ignota": "tieni"}})
+    assert local_reject_reason(de, keep, []) is None
+
+
+def test_queries_all_languages_on_single_marketplace():
+    h = parse_hunt({"ricerca": "x", "ebay": {"marketplaces": ["EBAY_IT"]}, "query_extra": ["manuale"]})
+    plan = {"query": {"it": ["i1", "i2"], "de": ["d1"], "pl": ["p1"], "en": ["e1", "e2"]}}
+    qs = queries_for("it", plan, h)
+    assert qs[0] == "manuale" and set(qs) == {"manuale", "i1", "i2", "d1", "p1", "e1", "e2"}
+    # alternanza: la prima di ogni lingua prima delle seconde
+    assert qs.index("d1") < qs.index("i2") and qs.index("p1") < qs.index("e2")
+
+
+class FakeEbayNoShip(FakeEbay):
+    """Come FakeEbay, ma il dettaglio dell'annuncio 2 dice che non spedisce in Italia."""
+    def __call__(self, req):
+        if "/item/" in req.url.path and "%7C2%7C" in str(req.url):
+            self.details += 1
+            return httpx.Response(200, json={"description": "ok", "shipToLocations": {
+                "regionIncluded": [{"regionType": "COUNTRY", "regionId": "DE"}]}})
+        return super().__call__(req)
+
+
+def test_verify_skips_items_not_shipping_here(env):
+    fake, llm = FakeEbayNoShip(), FakeLLM()
+    ebay, pal, groq = make_clients(env, fake, llm)
+    db = DB(env.db_path)
+    h = parse_hunt(HUNT)
+    stats = run_hunt(h, env, db, ebay, pal, groq)
+    assert stats.non_spediscono == 1
+    row = db.get_item(h.nome, "2")
+    assert row["screen_verdict"] == "no" and "non spedisce in IT" in row["screen_reason"]
+    assert row["score"] is None                       # Groq non l'ha visto
+    assert llm.calls["verify"] == stats.verificati == 1
+
+
+def test_links_point_to_ebay_it(env):
+    _seeded_db(env)
+    srv, base = _web(env)
+    try:
+        with httpx.Client(base_url=base) as c:
+            page = c.get("/caccia/test-mobo").text
+            assert 'href="https://www.ebay.it/itm/1"' in page
+            assert c.get("/api/caccia/test-mobo").json()[0]["link"] == "https://www.ebay.it/itm/1"
+    finally:
+        srv.shutdown()
+    assert env.item_link("123") == "https://www.ebay.it/itm/123"

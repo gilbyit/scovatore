@@ -67,6 +67,8 @@ def _print_stats(name: str, s) -> None:
     print(f"scremati {s.scremati} (no: {s.scremati_no}) | verificati {s.verificati} | conformi {s.conformi} "
           f"| notificati {s.notificati}")
     print(f"chiamate eBay {s.chiamate_ebay} | token Palantir {s.token_palantir} | token Groq {s.token_groq}")
+    if s.non_spediscono:
+        print(f"scartati in verifica perche' non spediscono qui {s.non_spediscono}")
     if s.scartati_paese or s.ricerche_saltate:
         print(f"scartati per paese {s.scartati_paese} | ricerche saltate per max_ricerche {s.ricerche_saltate}")
     if s.durate:
@@ -174,14 +176,14 @@ def _show(cfg: Config, name: str, min_score: int, limit: int, tutti: bool, csv_p
             v = json.loads(r["verify_json"])
             if v.get("sintesi"):
                 print(f"{'':>29}{v['sintesi'][:150]}")
-        print(f"{'':>29}{r['url']}")
+        print(f"{'':>29}{cfg.item_link(r['legacy_id'])}")
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["punteggio", "esito", "totale", "valuta", "titolo", "url", "sintesi", "rischi"])
             for r in rows:
                 v = json.loads(r["verify_json"] or "{}")
-                w.writerow([r["score"], r["verdict"], r["total"], r["currency"], r["title"], r["url"],
+                w.writerow([r["score"], r["verdict"], r["total"], r["currency"], r["title"], cfg.item_link(r["legacy_id"]),
                             v.get("sintesi", ""), "; ".join(v.get("segnali_rischio") or [])])
         print(f"\nCSV scritto in {csv_path}")
 
@@ -210,7 +212,7 @@ def cmd_controlla(cfg: Config, args) -> int:
             allowed = h.ebay.allowed_countries()
             print(f"      marketplace: {','.join(m.removeprefix('EBAY_') for m in h.ebay.marketplaces)} | "
                   f"paesi ammessi: {'tutti' if allowed is None else 'UE27' if len(allowed) == 27 else ','.join(sorted(allowed))}"
-                  f" | max_ricerche {h.ebay.max_ricerche}")
+                  f" | max_ricerche {h.ebay.max_ricerche} | lingue {','.join(h.languages())}")
     except HuntError as exc:
         print(f"ERRORE {exc}")
         ok = False

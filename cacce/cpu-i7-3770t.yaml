@@ -1,0 +1,45 @@
+nome: cpu-i7-3770t
+attiva: true
+ogni_minuti: 180
+
+ebay:
+  marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR, EBAY_ES]
+  valuta: EUR
+  prezzo_max: 60                 # tetto largo (combo ~50 + margine); le soglie fini le applica Groq
+  spedizione_inclusa: true
+  spedizione_ignota: tieni
+  regione: EUROPEAN_UNION
+  consegna_paese: IT
+  ordinamento: newlyListed
+  max_risultati_per_query: 100
+
+ricerca: >
+  Processore Intel Core i7-3770T (LGA1155, Ivy Bridge, 45 W, 4 core 8 thread).
+  Interessano tre casi: la sola CPU, la CPU venduta in combo con scheda madre
+  LGA1155, oppure combo scheda madre + CPU + RAM. Non interessano i7-3770K,
+  i7-3770S o i7-3770 senza T, ne' PC completi, portatili o schede madri
+  vendute senza CPU.
+
+query_extra:
+  - "i7-3770T"
+  - "i7 3770T"
+  - "SR0PQ"
+
+parole_escluse:
+  - 3770k
+  - 3770s
+  - laptop
+  - notebook
+  - portatile
+  - "pc completo"
+
+screening: true
+
+requisiti_avanzati: |
+  - Il processore deve essere esattamente un Intel Core i7-3770T (codice SR0PQ), non 3770, 3770K, 3770S o altre T diverse. Se il titolo dice solo "3770" senza T e la descrizione non chiarisce, esito incerto.
+  - Caso A, solo CPU: il totale con spedizione deve essere al massimo 30 EUR. Sono accettati fino a 40 EUR solo se l'annuncio consente offerte al ribasso (Best Offer / "accetta proposte"), perche' l'offerta puo' portare il prezzo verso i 30 EUR.
+  - Caso B, combo scheda madre + CPU: totale attorno ai 50 EUR. La scheda madre deve essere socket LGA1155 (chipset H61, B75, H77, Q77, Z77 o simili). Preferire nettamente i combo che includono anche la RAM (DDR3); un combo senza RAM ha punteggio piu' basso, uno con RAM viene favorito.
+  - La CPU deve risultare funzionante o testata. Segnalare come rischio: pin piegati o mancanti, CPU "non testata", "venduta come vista", foto stock, scheda madre difettosa.
+  - Non conta se la CPU e' tray/OEM o boxed, ma boxed con dissipatore e' un plus minore.
+  - Nella sintesi indicare chiaramente quale caso e' (A o B), il totale con spedizione, e se sono presenti RAM e mascherina I/O.
+  - Domande utili per il venditore: CPU testata? Pin integri? Accetta offerte? Quanta RAM e quale frequenza?

@@ -29,7 +29,7 @@ def notify(hunt: Hunt, db: DB, cfg: Config, transport: httpx.BaseTransport | Non
             v = json.loads(r["verify_json"] or "{}")
             body = f"{r['total']:.2f} {r['currency']} | {r['score']}/100\n{v.get('sintesi', '')}"
             # titolo e link come query string: gli header HTTP non reggono caratteri non ASCII
-            params = {"title": f"[{hunt.nome}] {r['title'][:80]}", "click": r["url"], "tags": "mag"}
+            params = {"title": f"[{hunt.nome}] {r['title'][:80]}", "click": cfg.item_link(r["legacy_id"]), "tags": "mag"}
             try:
                 resp = http.post(cfg.ntfy_url, content=body.encode("utf-8"), params=params,
                                  headers=headers_base)

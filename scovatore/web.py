@@ -307,7 +307,7 @@ def _btn(azione: str, lid: str, label: str, cls: str = "") -> str:
             f'{e(label)}</button>')
 
 
-def render_item(r: sqlite3.Row) -> str:
+def render_item(r: sqlite3.Row, link_domain: str = "ebay.it") -> str:
     keys = r.keys()
     v = json.loads(r["verify_json"] or "{}")
     img = r["image"] if "image" in keys else ""
@@ -350,7 +350,7 @@ def render_item(r: sqlite3.Row) -> str:
     badge = '<span class="chip man">a mano</span>' if manual else ""
     return f"""<div class="item{' manual' if manual else ''}"><div class="thumbcol">
 <input type="checkbox" class="sel" name="id" value="{e(lid)}" aria-label="seleziona">{thumb}</div><div>
-<a class="title" href="{e(r['url'])}" target="_blank" rel="noopener">{e(r['title'])}</a>
+<a class="title" href="https://www.{e(link_domain)}/itm/{e(r['legacy_id'])}" target="_blank" rel="noopener">{e(r['title'])}</a>
 <div class="meta">{chip_html}{' · visto ' + e(ago(r['first_seen']))}</div>
 {f'<div class="sintesi">{e(sintesi)}</div>' if sintesi else ''}
 <details><summary>Dettagli</summary>{detail}</details><div class="acts">{actions}</div></div>
@@ -359,7 +359,7 @@ def render_item(r: sqlite3.Row) -> str:
 <div class="meta">{badge}{e(esito)}</div></div></div>"""
 
 
-def render_hunt(conn, hunt: str, q: dict) -> str:
+def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> str:
     esito = q.get("esito", "verificati") if q.get("esito") in ESITI else "verificati"
     ordina = q.get("ordina", "punteggio") if q.get("ordina") in ORDINI else "punteggio"
     try:
@@ -395,7 +395,7 @@ def render_hunt(conn, hunt: str, q: dict) -> str:
 <label>Visti<select name="giorni">{opts(giorni_opt, str(giorni))}</select></label>
 <label>Ordina<select name="ordina">{opts(ORDINI, ordina)}</select></label>
 <button>Filtra</button></form>"""
-    items = "".join(render_item(x) for x in rows) or '<div class="empty">Nessun annuncio con questi filtri.</div>'
+    items = "".join(render_item(x, link_domain) for x in rows) or '<div class="empty">Nessun annuncio con questi filtri.</div>'
     more = f'<p class="meta">Mostrati i primi {LIMIT}.</p>' if len(rows) >= LIMIT else ""
     msg = f'<div class="flash">{e(q["msg"])}</div>' if q.get("msg") else ""
     back = urlencode({k: v for k, v in q.items() if k not in ("msg", "token")})
@@ -467,12 +467,13 @@ def apply_action(db_path: Path, hunt: str, form: dict[str, list[str]]) -> str:
     return f"{n} annuncio {AZIONI[azione][1]}." if n == 1 else f"{n} annunci {AZIONI[azione][2]}."
 
 
-def api_items(conn, hunt: str, q: dict) -> list[dict]:
+def api_items(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> list[dict]:
     rows = query_items(conn, hunt, q.get("esito", "verificati"), int(q.get("min") or 0),
                        (q.get("paese") or "").upper(), q.get("ordina", "punteggio"), int(q.get("giorni") or 0))
     out = []
     for r in rows:
         d = dict(r)
+        d["link"] = f"https://www.{link_domain}/itm/{d['legacy_id']}"
         d["verifica"] = json.loads(d.pop("verify_json") or "null")
         out.append(d)
     return out
@@ -562,9 +563,9 @@ def make_handler(cfg: Config):
                 if parts == ["giri"]:
                     return self._send(200, page("Giri", render_runs(conn), names, "__giri"))
                 if len(parts) == 2 and parts[0] == "caccia" and parts[1] in names:
-                    return self._send(200, page(parts[1], render_hunt(conn, parts[1], q), names, parts[1]))
+                    return self._send(200, page(parts[1], render_hunt(conn, parts[1], q, cfg.link_domain), names, parts[1]))
                 if len(parts) == 3 and parts[:2] == ["api", "caccia"] and parts[2] in names:
-                    return self._send(200, json.dumps(api_items(conn, parts[2], q), ensure_ascii=False),
+                    return self._send(200, json.dumps(api_items(conn, parts[2], q, cfg.link_domain), ensure_ascii=False),
                                       "application/json; charset=utf-8")
                 if parts == ["api", "giri"]:
                     return self._send(200, json.dumps(recent_runs(conn), ensure_ascii=False),

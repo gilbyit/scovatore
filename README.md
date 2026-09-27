@@ -151,7 +151,7 @@ attiva: true
 ogni_minuti: 240
 
 ebay:                          # tutto quello che eBay sa filtrare
-  marketplaces: ue             # tutti i siti eBay della UE
+  marketplaces: [EBAY_IT]      # si cerca su ebay.it
   paesi_ammessi: ue            # oggetto situato in uno dei 27 paesi UE
   prezzo_max: 150
   spedizione_inclusa: true
@@ -171,13 +171,13 @@ requisiti_avanzati: |          # per Groq: cosa verificare sul dettaglio
 
 | Campo | Default | Filtro eBay / effetto |
 |---|---|---|
-| `marketplaces` | `ue` | un giro di query per ciascuno, nella sua lingua più l'inglese. `ue` = `EBAY_IT, DE, FR, ES, NL, BE, AT, IE, PL`; si può mescolare: `[ue, EBAY_GB]` |
+| `marketplaces` | `[EBAY_IT]` | dove si cerca: ogni marketplace riceve le query di tutte le `lingue`. `ue` = `EBAY_IT, DE, FR, ES, NL, BE, AT, IE, PL`, sconsigliato (vedi sotto) |
 | `paesi_ammessi` | `ue` | controllo locale sul paese in cui si trova l'oggetto: `ue` (i 27 stati membri), una lista ISO (`[IT, DE, LT]`, anche `[ue, CH]`) oppure `tutti` |
 | `max_ricerche` | `150` | tetto di ricerche (query x marketplace) per giro; se taglia, taglia le query meno importanti su tutti i marketplace |
 | `valuta` | `EUR` | `priceCurrency`; gli annunci in altra valuta vengono scartati |
 | `prezzo_min`, `prezzo_max` | nessuno | `price:[min..max]` |
 | `spedizione_inclusa` | `true` | il budget vale su prezzo + spedizione (controllo locale) |
-| `spedizione_ignota` | `tieni` | `tieni` o `scarta` gli annunci senza costo di spedizione noto |
+| `spedizione_ignota` | `scarta_estero` | annunci senza costo di spedizione verso `consegna_paese`: `scarta_estero` li scarta se l'oggetto è all'estero (quasi sempre non spedisce qui) e li tiene se è in Italia (può essere ritiro a mano); oppure `tieni` / `scarta` |
 | `regione` | `EUROPEAN_UNION` | `itemLocationRegion` (anche `CONTINENTAL_EUROPE`, `WORLDWIDE`...) |
 | `paese` | nessuno | `itemLocationCountry`, alternativo a `regione` (eBay rifiuta entrambi) |
 | `consegna_paese` | `IT` | `deliveryCountry`: solo annunci che spediscono lì |
@@ -192,16 +192,24 @@ requisiti_avanzati: |          # per Groq: cosa verificare sul dettaglio
 | `max_risultati_per_query` | `100` | paginazione, massimo 200 per pagina |
 | `feedback_minimo` | nessuno | % minima di feedback del venditore (controllo locale) |
 
-#### Tutta la UE, non solo i paesi con un eBay
+#### Tutta la UE, cercando solo su ebay.it
 
-Non esiste un eBay per ogni paese: chi vende dalla Lituania, dalla Repubblica Ceca o dalla Slovenia pubblica su uno dei siti esistenti, quasi sempre ebay.de. Per questo la copertura UE sta in due filtri, non nell'elenco dei marketplace:
+Su ebay.it compaiono anche gli annunci dei venditori degli altri paesi UE che spediscono in Italia. Per questo si cerca su un solo marketplace, con tre filtri:
 
-- `regione: EUROPEAN_UNION` chiede a eBay solo oggetti situati nella UE (supportato da tutti i marketplace europei);
-- `paesi_ammessi: ue` ricontrolla in locale il paese dell'annuncio contro i 27 stati membri. Serve perché le aree geografiche di eBay non coincidono per forza con l'unione doganale: Regno Unito, Svizzera e Norvegia costano dogana e IVA all'import.
+- `regione: EUROPEAN_UNION` chiede a eBay solo oggetti situati nella UE;
+- `consegna_paese: IT` (con il contesto acquirente `EBAY_BUYER_COUNTRY`) solo annunci che spediscono in Italia;
+- `paesi_ammessi: ue` ricontrolla in locale il paese dell'annuncio contro i 27 stati membri: Regno Unito, Svizzera e Norvegia costano dogana e IVA all'import.
 
-I marketplace in più servono a far girare le query nella lingua locale (un venditore polacco scrive il titolo in polacco anche su ebay.de), e come rete di sicurezza per gli annunci visibili solo su un sito. Il log di ogni giro dice quanti annunci nuovi ha portato ciascun marketplace: se uno porta sempre zero, toglilo dalla lista.
+Quello che resta si gioca sulle **lingue**: un venditore lituano o polacco scrive il titolo nella sua lingua anche quando l'annuncio è visibile su ebay.it. Per questo tutte le query del piano (italiano, inglese, tedesco, francese, spagnolo, olandese, polacco) partono su ebay.it.
 
-**Costo in chiamate.** Con 9 marketplace, 4 query per lingua e 2 `query_extra` un giro fa circa 85 ricerche più fino a 25 dettagli. Una caccia ogni 3 ore sta intorno alle 900 chiamate al giorno, contro le 5000 di eBay. Cambiare i marketplace cambia le lingue, quindi al primo giro Palantir rigenera il piano.
+Cercare anche su ebay.de & co. (`marketplaces: ue`) resta possibile, ma porta annunci che spesso **non spediscono in Italia** e link su siti dove non sei loggato. Scovatore li filtra in due punti:
+
+1. **filtri locali**: un annuncio dall'estero senza costo di spedizione per l'Italia viene scartato (`spedizione_ignota: scarta_estero`, default);
+2. **prima della verifica**: il dettaglio eBay dice dove spedisce il venditore (`shipToLocations`). Se esclude l'Italia, o ammette solo un elenco di paesi senza l'Italia, l'annuncio finisce tra gli scartati con motivo "non spedisce in IT" e Groq non lo vede. Nel dubbio l'annuncio passa.
+
+**Link**: interfaccia, notifiche e CSV puntano sempre a `https://www.ebay.it/itm/<id>` (`SCOVATORE_LINK_DOMAIN`), qualunque sia il marketplace dove è stato trovato: lo stesso ID vale su tutti i siti eBay e su quello italiano vedi subito spedizione e prezzo per l'Italia.
+
+**Costo in chiamate.** Con un solo marketplace, 7 lingue da 4 query e 2 `query_extra` un giro fa circa 30 ricerche più fino a 25 dettagli: con una caccia ogni 3 ore, intorno alle 450 chiamate al giorno. Cambiare le lingue rigenera il piano al primo giro.
 
 Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabile solo insieme a una categoria foglia. Senza `categorie` è meglio lasciarlo vuoto: altrimenti si rischiano risultati mancanti.
 
@@ -215,6 +223,7 @@ Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabil
 | `parole_escluse` | `[]` | scarto locale sul titolo, a parola intera. Si sommano a quelle proposte da Palantir |
 | `screening` | `true` | scrematura dei titoli con Palantir. Con `false` va tutto a Groq (attenzione ai token) |
 | `dati_riferimento` | nessuno | file di testo o CSV, percorso relativo al file YAML, passato a Groq come fonte da preferire alla sua memoria |
+| `lingue` | `ue` | lingue delle query: `ue` = `it, en, de, fr, es, nl, pl`, oppure una lista. Si aggiungono sempre l'inglese e la lingua dei marketplace |
 | `max_query_per_lingua` | `4` | tetto sulle query generate per ciascuna lingua |
 | `attiva` | `true` | le cacce disattivate non girano in `loop` e `tutte` |
 | `ogni_minuti` | `180` | intervallo minimo fra due esecuzioni automatiche |

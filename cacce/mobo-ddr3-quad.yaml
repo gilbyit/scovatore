@@ -6,13 +6,13 @@ ogni_minuti: 180
 
 # --- Parametri eBay: tutto cio' che eBay filtra da solo -------------------
 ebay:
-  marketplaces: ue              # tutti i siti eBay UE (IT DE FR ES NL BE AT IE PL)
+  marketplaces: [EBAY_IT]       # si cerca su ebay.it: vede anche i venditori UE che spediscono in Italia
   paesi_ammessi: ue             # oggetto in uno dei 27 paesi UE: niente dogana. Anche [IT, DE, LT] o tutti
-  max_ricerche: 150             # tetto di ricerche per giro (query x marketplace)
+  max_ricerche: 60              # tetto di ricerche per giro (query x marketplace)
   valuta: EUR
   prezzo_max: 100
   spedizione_inclusa: true      # il budget vale su prezzo + spedizione (controllo locale)
-  spedizione_ignota: tieni      # tieni | scarta gli annunci senza costo di spedizione noto
+  spedizione_ignota: scarta_estero  # senza costo di spedizione verso IT: dall'estero si scarta
   regione: EUROPEAN_UNION       # oggetto situato nella UE
   consegna_paese: IT            # spedisce in Italia
   condizioni: [usato, ricondizionato]
@@ -21,6 +21,9 @@ ebay:
   feedback_minimo: 97
 
 # --- Per Palantir: cosa cercare, solo gli elementi chiave ------------------
+# Lingue delle query, tutte lanciate su ebay.it: i venditori esteri titolano nella loro lingua
+lingue: ue                      # it en de fr es nl pl
+
 ricerca: >
   Scheda madre con memoria DDR3 quad channel, venduta con la CPU montata o inclusa.
   Meglio se c'e' anche la RAM.

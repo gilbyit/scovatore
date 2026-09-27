@@ -35,6 +35,7 @@ class RunStats:
     scremati: int = 0
     scremati_no: int = 0
     verificati: int = 0
+    non_spediscono: int = 0
     conformi: int = 0
     notificati: int = 0
     chiamate_ebay: int = 0
@@ -181,8 +182,18 @@ def _plan_summary(plan: dict) -> str:
 
 
 def queries_for(marketplace_lang: str, plan: dict, hunt: Hunt) -> list[str]:
+    """Query da lanciare su un marketplace: prima quelle manuali, poi tutte le lingue del piano.
+
+    Le lingue si alternano (la n.1 di ogni lingua, poi la n.2...) partendo da quella del
+    marketplace e dall'inglese: se max_ricerche taglia, perde le varianti meno importanti
+    di ogni lingua invece di una lingua intera.
+    """
+    langs = [marketplace_lang, "en"] + [l for l in hunt.languages() if l not in (marketplace_lang, "en")]
+    per_lang = [plan["query"].get(l, []) for l in langs]
+    depth = max((len(q) for q in per_lang), default=0)
+    ordered = [qs[i] for i in range(depth) for qs in per_lang if i < len(qs)]
     out: list[str] = []
-    for q in list(hunt.query_extra) + plan["query"].get(marketplace_lang, []) + plan["query"].get("en", []):
+    for q in list(hunt.query_extra) + ordered:
         if q.lower() not in (x.lower() for x in out):
             out.append(q)
     return out
@@ -198,8 +209,13 @@ def local_reject_reason(l: Listing, hunt: Hunt, excluded: list[str]) -> str | No
         return f"paese {l.country} fuori area"
     if l.currency and l.currency != p.valuta:
         return f"valuta {l.currency}"
-    if l.shipping is None and p.spedizione_ignota == "scarta":
-        return "spedizione ignota"
+    if l.shipping is None:
+        if p.spedizione_ignota == "scarta":
+            return "spedizione ignota"
+        dest = (p.consegna_paese or "").upper()
+        if p.spedizione_ignota == "scarta_estero" and dest and l.country and l.country.upper() != dest:
+            # dall'estero, senza costo di spedizione per il nostro paese: quasi sempre non spedisce qui
+            return f"non spedisce in {dest} (da {l.country}, spedizione ignota)"
     if p.prezzo_max is not None:
         cost = l.total if p.spedizione_inclusa else l.price
         if cost > p.prezzo_max:
@@ -351,6 +367,13 @@ def verify(hunt: Hunt, items: list[Listing], ebay: EbayClient, groq: LLMClient, 
             ebay.get_item(l, cfg.description_max_chars)
         except EbayError as exc:
             log.warning("[%s] dettaglio non disponibile per %s: %s", hunt.nome, l.legacy_id, exc)
+        dest = (hunt.ebay.consegna_paese or "").upper()
+        if l.ships_to_buyer is False and dest:
+            # il dettaglio dice che non spedisce da noi: inutile spendere token Groq
+            db.set_screen(hunt.nome, l.legacy_id, "no", f"non spedisce in {dest} (dettaglio eBay)")
+            stats.non_spediscono += 1
+            log.info("[%s]   -> scartato: il venditore non spedisce in %s", hunt.nome, dest)
+            continue
         try:
             res = groq.chat_json(prompts.VERIFY_SYSTEM,
                                  prompts.verify_user(hunt.ricerca, hunt.requisiti_avanzati, ref,
@@ -389,6 +412,8 @@ def _reason_key(reason: str) -> str:
         return "feedback basso"
     if reason.startswith("valuta"):
         return "altra valuta"
+    if reason.startswith("non spedisce"):
+        return "non spedisce qui"
     return reason
 
 

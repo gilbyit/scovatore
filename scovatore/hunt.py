@@ -43,6 +43,11 @@ EU27: frozenset[str] = frozenset({
     "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
 })
 
+# Lingue delle query quando si cerca "in tutta la UE" da un solo marketplace: su ebay.it
+# compaiono anche gli annunci dei venditori esteri che spediscono in Italia, ma con il titolo
+# nella loro lingua. Una query tedesca lanciata su ebay.it trova il venditore di Berlino.
+EU_LANGS: list[str] = ["it", "en", "de", "fr", "es", "nl", "pl"]
+
 VALID_BUYING = {"FIXED_PRICE", "AUCTION", "BEST_OFFER"}
 VALID_REGIONS = {"EUROPEAN_UNION", "CONTINENTAL_EUROPE", "BORDER_COUNTRIES", "WORLDWIDE",
                  "UK_AND_IRELAND", "NORTH_AMERICA", "ASIA"}
@@ -55,12 +60,12 @@ class HuntError(ValueError):
 
 @dataclass
 class EbayParams:
-    marketplaces: list[str] = field(default_factory=lambda: list(EU_MARKETPLACES))  # "ue" = tutti i siti UE
+    marketplaces: list[str] = field(default_factory=lambda: ["EBAY_IT"])  # dove si cerca; "ue" = tutti i siti UE
     valuta: str = "EUR"
     prezzo_min: float | None = None
     prezzo_max: float | None = None
     spedizione_inclusa: bool = True          # il budget vale su prezzo + spedizione
-    spedizione_ignota: str = "tieni"          # tieni | scarta: annunci senza costo di spedizione noto
+    spedizione_ignota: str = "scarta_estero"  # tieni | scarta | scarta_estero: annunci senza costo di spedizione noto
     regione: str | None = "EUROPEAN_UNION"   # itemLocationRegion
     paese: str | None = None                  # itemLocationCountry (alternativo a regione)
     consegna_paese: str | None = "IT"         # deliveryCountry
@@ -95,6 +100,7 @@ class Hunt:
     screening: bool = True                    # passaggio Palantir sui titoli
     dati_riferimento: str | None = None       # file (CSV/testo) passato a Groq come fonte
     max_query_per_lingua: int = 4
+    lingue: list[str] | None = None           # lingue delle query; default: tutte quelle UE (EU_LANGS)
     attiva: bool = True
     ogni_minuti: int = 180
     path: Path | None = None
@@ -111,8 +117,9 @@ class Hunt:
         return hashlib.sha256(src.encode()).hexdigest()[:16]
 
     def languages(self) -> list[str]:
-        langs = {MARKETPLACE_LANG.get(m, "en") for m in self.ebay.marketplaces}
-        langs.add("en")  # per l'hardware l'inglese rende su tutti i marketplace
+        langs = set(self.lingue if self.lingue else EU_LANGS)
+        langs |= {MARKETPLACE_LANG.get(m, "en") for m in self.ebay.marketplaces}
+        langs.add("en")  # per l'hardware l'inglese rende ovunque
         return sorted(langs)
 
     def reference_text(self) -> str:
@@ -145,7 +152,7 @@ def _conditions(raw) -> list[int]:
 def _marketplaces(raw) -> list[str]:
     """Accetta una lista o l'alias 'ue' (anche dentro la lista), senza duplicati."""
     if raw is None:
-        return list(EU_MARKETPLACES)
+        return ["EBAY_IT"]
     items = [raw] if isinstance(raw, str) else list(raw)
     out: list[str] = []
     for m in items:
@@ -159,6 +166,23 @@ def _marketplaces(raw) -> list[str]:
     if not out:
         raise HuntError("serve almeno un marketplace")
     return out
+
+
+def _languages(raw) -> list[str] | None:
+    """'ue' -> tutte le lingue UE; altrimenti lista di codici (it, de, ...)."""
+    from .prompts import LANG_NAMES
+    if raw is None:
+        return None
+    items = [raw] if isinstance(raw, str) else list(raw)
+    out: list[str] = []
+    for l in items:
+        l = str(l).strip().lower()
+        for x in (EU_LANGS if l in ("ue", "eu") else [l]):
+            if x not in LANG_NAMES:
+                raise HuntError(f"lingua non supportata: {x!r} (valide: {sorted(LANG_NAMES)} o 'ue')")
+            if x not in out:
+                out.append(x)
+    return out or None
 
 
 def _countries(raw) -> list[str] | None:
@@ -209,8 +233,8 @@ def parse_hunt(data: dict, path: Path | None = None) -> Hunt:
         raise HuntError(f"regione non valida: {ep.regione}")
     if ep.ordinamento not in VALID_SORT:
         raise HuntError(f"ordinamento non valido: {ep.ordinamento}")
-    if ep.spedizione_ignota not in ("tieni", "scarta"):
-        raise HuntError("spedizione_ignota deve essere 'tieni' o 'scarta'")
+    if ep.spedizione_ignota not in ("tieni", "scarta", "scarta_estero"):
+        raise HuntError("spedizione_ignota deve essere 'tieni', 'scarta' o 'scarta_estero'")
     if ep.tipo_venditore and ep.tipo_venditore not in ("BUSINESS", "INDIVIDUAL"):
         raise HuntError("tipo_venditore deve essere BUSINESS o INDIVIDUAL")
     if ep.paese and ep.paesi_ammessi is None:
@@ -226,6 +250,8 @@ def parse_hunt(data: dict, path: Path | None = None) -> Hunt:
         raise HuntError(f"campi sconosciuti: {sorted(unknown_top)}")
 
     fields = {k: v for k, v in data.items() if k in top_known}
+    if "lingue" in fields:
+        fields["lingue"] = _languages(fields["lingue"])
     fields["nome"] = _slug(str(data.get("nome") or (path.stem if path else "caccia")))
     return Hunt(ebay=ep, path=path, **fields)
 

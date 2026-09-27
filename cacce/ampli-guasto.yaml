@@ -5,9 +5,9 @@ attiva: true
 ogni_minuti: 240
 
 ebay:
-  marketplaces: ue              # tutti i siti eBay UE (IT DE FR ES NL BE AT IE PL)
+  marketplaces: [EBAY_IT]       # si cerca su ebay.it: vede anche i venditori UE che spediscono in Italia
   paesi_ammessi: ue             # oggetto in uno dei 27 paesi UE: niente dogana. Anche [IT, DE, LT] o tutti
-  max_ricerche: 150             # tetto di ricerche per giro (query x marketplace)
+  max_ricerche: 60              # tetto di ricerche per giro (query x marketplace)
   valuta: EUR
   prezzo_max: 150               # da regolare
   spedizione_inclusa: true
@@ -16,6 +16,9 @@ ebay:
   condizioni: [guasto]          # conditionId 7000: "per ricambi o non funzionante"
   ordinamento: newlyListed
   max_risultati_per_query: 100
+
+# Lingue delle query, tutte lanciate su ebay.it: i venditori esteri titolano nella loro lingua
+lingue: ue                      # it en de fr es nl pl
 
 ricerca: >
   Amplificatore audio hi-fi (integrato, finale o ricevitore stereo) guasto o non funzionante,
