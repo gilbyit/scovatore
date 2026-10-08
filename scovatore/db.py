@@ -176,6 +176,26 @@ class DB:
                               (hunt,)).fetchone()
         return dict(r) if r else None
 
+    def hunt_counts(self, hunt: str) -> dict[str, int]:
+        """Quante righe di una caccia ci sono nel DB (per la conferma di eliminazione)."""
+        q = lambda t: self.conn.execute(f"SELECT COUNT(*) FROM {t} WHERE hunt=?", (hunt,)).fetchone()[0]
+        return {"annunci": q("items"), "giri": q("runs"), "piani": q("plans"), "richieste": q("run_requests")}
+
+    def delete_hunt_data(self, hunt: str) -> dict[str, int]:
+        """Cancella dal DB tutti i dati di una caccia (annunci, giri, piani, richieste). Il file YAML non si tocca.
+
+        I giri di oggi (UTC) restano: il tetto giornaliero di chiamate eBay si calcola proprio da
+        quelli, e cancellarli lo azzererebbe a meta' giornata.
+        """
+        counts = self.hunt_counts(hunt)
+        with self.conn:
+            for t in ("items", "plans", "run_requests"):
+                self.conn.execute(f"DELETE FROM {t} WHERE hunt=?", (hunt,))
+            cur = self.conn.execute("DELETE FROM runs WHERE hunt=? AND substr(started_at, 1, 10) != ?",
+                                    (hunt, now()[:10]))
+        counts["giri"] = cur.rowcount
+        return counts
+
     def ebay_calls_today(self) -> int:
         """Chiamate eBay dal giorno corrente (UTC), sommando le statistiche delle esecuzioni."""
         today = now()[:10]

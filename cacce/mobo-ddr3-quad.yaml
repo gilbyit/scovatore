@@ -3,6 +3,7 @@
 nome: mobo-ddr3-quad
 attiva: false
 ogni_minuti: 180
+fonti: [ebay, vinted, subito]   # ricerche attive; i prezzi di Vinted e Subito seguono prezzo_max di ebay
 
 # --- Parametri eBay: tutto cio' che eBay filtra da solo -------------------
 ebay:
