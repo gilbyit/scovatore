@@ -6,6 +6,7 @@ Le risposte simulate seguono la struttura che i due siti usano oggi (da verifica
 import json
 import threading
 from dataclasses import replace
+from pathlib import Path
 from http.server import ThreadingHTTPServer
 
 import httpx
@@ -682,6 +683,138 @@ def test_cacce_di_esempio_con_fonti():
     ex = hunts["esempio-fonti"]
     assert ex.fonti == ["ebay", "vinted", "subito"] and ex.attiva is False   # l'esempio non gira da solo
     assert ex.vinted.spedizione_stimata == 5 and ex.subito.regione == "piemonte"
-    for nome, h in hunts.items():
-        if nome != "esempio-fonti":
-            assert h.fonti == ["ebay"], nome                    # le cacce esistenti non cambiano
+
+
+# ---------------------------------------------------- cacce spente / eliminate e cancellazione dati
+def _popola(cfg, nome="multi"):
+    """Mette nel DB una caccia con annunci e un giro, come se avesse girato."""
+    hunt = parse_hunt(yaml.safe_load(HUNT_YAML))
+    ebay, pal, groq = make_clients(cfg, FakeEbay(), SpyLLM())
+    db = DB(cfg.db_path)
+    run_hunt(hunt, cfg, db, ebay, pal, groq, sources={"vinted": vinted_src(hunt, FakeVinted()),
+                                                      "subito": subito_src(hunt, FakeSubito())})
+    return db
+
+
+def test_web_mostra_cacce_spente_ed_eliminate(servizio):
+    cfg, _ = servizio
+    db = _popola(cfg)
+    # "fantasma": ha dati nel DB ma nessun file YAML. "spenta": file con attiva: false
+    db.conn.execute("INSERT INTO items(hunt, legacy_id, item_id, first_seen, last_seen) VALUES "
+                    "('fantasma','1','1','2026-01-01T00:00:00','2026-01-01T00:00:00')")
+    db.conn.commit()
+    (cfg.hunts_dir / "spenta.yaml").write_text(HUNT_YAML.replace("nome: multi", "nome: spenta\nattiva: false"), encoding="utf-8")
+    (cfg.hunts_dir / "rotta.yaml").write_text("nome: rotta\nattiva: [", encoding="utf-8")
+    db.conn.execute("INSERT INTO items(hunt, legacy_id, item_id, first_seen, last_seen) VALUES "
+                    "('rotta','1','1','2026-01-01T00:00:00','2026-01-01T00:00:00')")
+    db.conn.commit()
+    srv, base = _serve(cfg)
+    try:
+        with httpx.Client(base_url=base) as c:
+            home = c.get("/").text
+            assert "Spente" in home and "Eliminate" in home
+            assert home.index("Spente") < home.index("Eliminate")
+            # i tre stati sono distinti: la caccia con il file rotto NON si dichiara eliminata
+            assert 'chip off">eliminata' in home and 'chip off">spenta' in home and "file non valido" in home
+            assert c.get("/caccia/fantasma").text.count("Caccia eliminata") == 1
+            assert "Riesegui ora" not in c.get("/caccia/fantasma").text          # senza file non si puo' rieseguire
+            assert "Caccia spenta" in c.get("/caccia/spenta").text and "Riesegui ora" in c.get("/caccia/spenta").text
+            assert "Elimina i dati" in c.get("/caccia/spenta").text
+            assert "Elimina i dati" not in c.get("/caccia/multi").text           # la attiva non si puo'
+            assert "Elimina i dati" not in c.get("/caccia/rotta").text
+    finally:
+        srv.shutdown()
+        db.close()
+
+
+def test_web_senza_cartella_cacce_non_dice_eliminata(servizio):
+    cfg, _ = servizio
+    db = _popola(cfg)
+    srv, base = _serve(replace(cfg, hunts_dir=cfg.hunts_dir / "non-montata"))
+    try:
+        with httpx.Client(base_url=base) as c:
+            assert "eliminata" not in c.get("/").text and "Eliminate" not in c.get("/").text
+            r = c.post("/caccia/multi/elimina", data={"conferma": "multi"})
+            assert r.status_code == 303
+            assert db.hunt_counts("multi")["annunci"] > 0             # cartella assente: non si cancella nulla
+    finally:
+        srv.shutdown()
+        db.close()
+
+
+def test_web_elimina_dati_con_conferma(servizio):
+    cfg, _ = servizio
+    db = _popola(cfg)
+    # un giro vecchio e uno di oggi: quello di oggi resta (serve al tetto giornaliero delle chiamate eBay)
+    db.conn.execute("INSERT INTO runs(hunt, started_at, finished_at, stats_json) VALUES "
+                    "('multi','2020-01-01T00:00:00','2020-01-01T00:01:00','{}')")
+    db.conn.commit()
+    altra = db.hunt_counts("multi")
+    assert altra["annunci"] > 0 and altra["giri"] >= 2
+    db.conn.execute("INSERT INTO items(hunt, legacy_id, item_id, first_seen, last_seen) VALUES "
+                    "('altra','1','1','2026-01-01T00:00:00','2026-01-01T00:00:00')")
+    db.conn.commit()
+    yaml_path = cfg.hunts_dir / "multi.yaml"
+    yaml_prima = yaml_path.read_text(encoding="utf-8")
+    srv, base = _serve(cfg)
+    try:
+        with httpx.Client(base_url=base) as c:
+            # attiva: rifiutata, sia la pagina sia la POST
+            assert "attiva" in c.get("/caccia/multi/elimina").text and "Elimina i dati</button>" not in \
+                c.get("/caccia/multi/elimina").text
+            r = c.post("/caccia/multi/elimina", data={"conferma": "multi"})
+            assert "non+consentita" in r.headers["location"] and db.hunt_counts("multi")["annunci"] > 0
+
+            # spegnere il file YAML la rende eliminabile
+            yaml_path.write_text(yaml_prima.replace("nome: multi\n", "nome: multi\nattiva: false\n"), encoding="utf-8")
+            conferma = c.get("/caccia/multi/elimina").text
+            assert f"<b>{altra['annunci']}</b> annunci" in conferma and "non viene toccato" in conferma
+            assert 'name="conferma"' in conferma
+
+            # nome sbagliato o mancante: non cancella
+            for form in ({"conferma": "altro"}, {"conferma": ""}, {}):
+                r = c.post("/caccia/multi/elimina", data=form)
+                assert "non+corrisponde" in r.headers["location"]
+            assert db.hunt_counts("multi")["annunci"] == altra["annunci"]
+
+            # richiesta in coda: non cancella
+            db.request_run("multi")
+            r = c.post("/caccia/multi/elimina", data={"conferma": "multi"})
+            assert "in+coda" in r.headers["location"] and db.hunt_counts("multi")["annunci"] > 0
+            db.conn.execute("DELETE FROM run_requests")
+            db.conn.commit()
+
+            # conferma giusta
+            r = c.post("/caccia/multi/elimina", data={"conferma": "multi"})
+            assert r.status_code == 303 and r.headers["location"].startswith("/?msg=")
+            assert "eliminati" in c.get(r.headers["location"]).text
+        after = db.hunt_counts("multi")
+        assert after["annunci"] == 0 and after["piani"] == 0 and after["richieste"] == 0
+        assert after["giri"] == altra["giri"] - 1                         # tolto solo il giro del 2020
+        assert db.hunt_counts("altra")["annunci"] == 1                    # le altre cacce intatte
+        assert yaml_path.read_text(encoding="utf-8").count("attiva: false") == 1   # il file non e' stato toccato
+    finally:
+        srv.shutdown()
+        db.close()
+
+
+def test_web_elimina_dati_caccia_eliminata_e_token(servizio):
+    cfg, _ = servizio
+    db = _popola(cfg)
+    (cfg.hunts_dir / "multi.yaml").unlink()                              # file rimosso: caccia "eliminata"
+    srv, base = _serve(replace(cfg, web_token="segreto"))
+    try:
+        with httpx.Client(base_url=base) as c:
+            assert c.post("/caccia/multi/elimina", data={"conferma": "multi"}).status_code == 403
+            c.get("/", params={"token": "segreto"})
+            assert c.post("/caccia/multi/elimina", data={"conferma": "multi"}).status_code == 303
+        assert db.hunt_counts("multi")["annunci"] == 0
+    finally:
+        srv.shutdown()
+        db.close()
+
+
+def test_cacce_del_repo_attivano_tutte_le_fonti():
+    from scovatore.hunt import load_all
+    hunts = load_all(Path(__file__).resolve().parent.parent / "cacce")
+    assert hunts and all(set(h.fonti) == {"ebay", "vinted", "subito"} for h in hunts)

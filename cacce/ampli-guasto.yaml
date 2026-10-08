@@ -4,6 +4,7 @@
 nome: ampli-guasto
 attiva: true
 ogni_minuti: 240
+fonti: [ebay, vinted, subito]   # ricerche attive; i prezzi di Vinted e Subito seguono prezzo_max di ebay
 
 ebay:
   marketplaces: [EBAY_IT]       # si cerca su ebay.it: vede anche i venditori UE che spediscono in Italia

@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from .config import Config
 from .db import DB, MANUAL_VERDICTS, STALE_RUN_HOURS
+import yaml
+
 from .hunt import SOURCE_LABELS, SOURCES, Hunt, load_hunt
 
 log = logging.getLogger(__name__)
@@ -116,6 +118,41 @@ def hunt_defs(cfg: Config) -> dict[str, Hunt]:
         except Exception as exc:
             log.debug("web: caccia %s non letta: %s", p.name, exc)
     return out
+
+
+def hunt_files(cfg: Config) -> tuple[dict[str, Hunt], set[str], bool]:
+    """(cacce valide per nome, nomi di TUTTI i file YAML anche se non validi, cartella leggibile?).
+
+    Serve a distinguere una caccia eliminata (file sparito) da una caccia con il file rotto o dalla
+    cartella non montata: in quei due casi non si deve mai dire "eliminata".
+    """
+    defs = hunt_defs(cfg)
+    names: set[str] = set(defs)
+    try:
+        files = sorted(cfg.hunts_dir.glob("*.y*ml"))
+        ok = cfg.hunts_dir.is_dir()
+    except OSError:
+        return defs, names, False
+    for p in files:
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8"))
+            names.add(str(data.get("nome")) if isinstance(data, dict) and data.get("nome") else p.stem)
+        except Exception:
+            names.add(p.stem)
+    return defs, names, ok
+
+
+def hunt_state(name: str, defs: dict[str, Hunt], file_names: set[str] | None, dir_ok: bool) -> str:
+    """attiva | spenta | eliminata (file YAML rimosso, dati ancora nel DB) | non_valida | ignota."""
+    if name in defs:
+        return "attiva" if defs[name].attiva else "spenta"
+    if file_names is None or not dir_ok:
+        return "ignota"          # cartella delle cacce non disponibile: non si puo' dire
+    return "non_valida" if name in file_names else "eliminata"
+
+
+STATE_CHIP = {"spenta": ("spenta", "off"), "eliminata": ("eliminata", "off"), "non_valida": ("file non valido", "off")}
+DELETABLE = ("spenta", "eliminata")
 
 
 def run_status(conn: sqlite3.Connection, hunt: str) -> dict:
@@ -266,6 +303,9 @@ border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:
 form.f label.chk{flex-direction:row;align-items:center;gap:6px;font-size:13px}
 button:disabled{opacity:.45;cursor:not-allowed}
 .chip.run{background:var(--mid);color:var(--card)}
+.chip.off{background:var(--line);color:var(--muted)}
+h2.grp{font-size:15px;margin:22px 0 -6px}
+.danger{border:1px solid var(--lo,#c0392b);border-radius:10px;padding:14px;margin:14px 0}
 @media (max-width:640px){.item{grid-template-columns:64px 1fr}.thumb{width:64px;height:64px}
 .right{grid-column:1/-1;text-align:left;display:flex;gap:12px;align-items:center}}
 """
@@ -301,8 +341,10 @@ def all_hunt_names(conn, defs: dict[str, Hunt]) -> list[str]:
     return sorted({h["hunt"] for h in hunts_overview(conn)} | set(defs))
 
 
-def render_home(conn, defs: dict[str, Hunt] | None = None) -> tuple[str, list[str]]:
+def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] | None = None,
+                dir_ok: bool = False, msg: str = "") -> tuple[str, list[str]]:
     defs = defs or {}
+    flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
     by_name = {h["hunt"]: h for h in hunts_overview(conn)}
     for n in defs:   # caccia definita ma mai girata: compare lo stesso, con i contatori a zero
         by_name.setdefault(n, {"hunt": n, "totale": 0, "verificati": 0, "conformi": 0, "attesa": 0,
@@ -310,9 +352,12 @@ def render_home(conn, defs: dict[str, Hunt] | None = None) -> tuple[str, list[st
     hs = [by_name[n] for n in sorted(by_name)]
     names = [h["hunt"] for h in hs]
     if not hs:
-        return '<div class="empty">Nessun annuncio nel database: la prima caccia non ha ancora girato.</div>', names
-    cards = []
+        return flash + '<div class="empty">Nessun annuncio nel database: la prima caccia non ha ancora girato.</div>', names
+    cards: dict[str, list[str]] = {"attiva": [], "spenta": [], "eliminata": []}
     for h in hs:
+        state = hunt_state(h["hunt"], defs, file_names, dir_ok)
+        label, cls = STATE_CHIP.get(state, ("", ""))
+        state_chip = f'<span class="chip {cls}">{label}</span>' if label else ""
         fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>'
                         for s in (defs[h["hunt"]].fonti if h["hunt"] in defs else []))
         st = run_status(conn, h["hunt"])
@@ -331,14 +376,23 @@ def render_home(conn, defs: dict[str, Hunt] | None = None) -> tuple[str, list[st
             elif r["stats"].get("errori"):
                 n = len(r["stats"]["errori"])
                 err = f'<div class="err">{n} error{"e" if n == 1 else "i"} nell\'ultimo giro: {e(r["stats"]["errori"][0][:120])}</div>'
-        cards.append(f"""<a class="card" href="/caccia/{quote(h['hunt'])}" style="text-decoration:none;color:inherit">
-<h2>{e(h['hunt'])}</h2><div class="meta" style="margin:-4px 0 6px">{fonti}{stato}</div>
+        cards["eliminata" if state == "eliminata" else "spenta" if state in ("spenta", "non_valida") else "attiva"].append(f"""<a class="card" href="/caccia/{quote(h['hunt'])}" style="text-decoration:none;color:inherit">
+<h2>{e(h['hunt'])}</h2><div class="meta" style="margin:-4px 0 6px">{state_chip}{fonti}{stato}</div>
 <div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
 <div><b>{h['verificati'] or 0}</b><span>verificati</span></div><div><b>{h['attesa'] or 0}</b><span>in attesa</span></div>
 <div><b>{h['totale']}</b><span>visti</span></div></div>
 {f'<div class="meta">{h["eliminati"]} eliminati a mano</div>' if h.get("eliminati") else ''}
 <div class="meta">{e(run_line)} · ultimo annuncio nuovo {e(ago(h['ultimo_nuovo']))}</div>{err}</a>""")
-    return f'<h1>Cacce</h1><div class="cards">{"".join(cards)}</div>', names
+    out = [f"<h1>Cacce</h1>{flash}"]
+    titles = {"attiva": None,
+              "spenta": "Spente <span class='meta'>(attiva: false nel file YAML: non girano da sole)</span>",
+              "eliminata": "Eliminate <span class='meta'>(file YAML rimosso: restano solo i dati nel database)</span>"}
+    for key in ("attiva", "spenta", "eliminata"):
+        if cards[key]:
+            if titles[key]:
+                out.append(f"<h2 class='grp'>{titles[key]}</h2>")
+            out.append(f'<div class="cards">{"".join(cards[key])}</div>')
+    return "".join(out), names
 
 
 def _req_rows(v: dict) -> str:
@@ -459,7 +513,70 @@ def render_rerun(conn, hunt: str, info: Hunt | None, q: dict) -> tuple[str, dict
     return form, st
 
 
-def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hunt | None = None) -> tuple[str, int]:
+def state_banner(hunt: str, state: str) -> str:
+    """Avviso in cima alla pagina di una caccia spenta o eliminata, col link per eliminarne i dati."""
+    if state == "spenta":
+        txt = "Caccia spenta (<code>attiva: false</code>): non gira da sola, ma si puo' rieseguire a mano."
+    elif state == "eliminata":
+        txt = "Caccia eliminata: il file YAML non c'e' piu', restano i dati nel database. Non si puo' rieseguire."
+    elif state == "non_valida":
+        return "<div class='flash'>Il file YAML di questa caccia non e' valido: controlla il log del servizio.</div>"
+    else:
+        return ""
+    link = f' <a href="/caccia/{quote(hunt)}/elimina">Elimina i dati dal database...</a>' if state in DELETABLE else ""
+    return f"<div class='flash'>{txt}{link}</div>"
+
+
+def render_delete(conn, hunt: str, state: str, status: dict, msg: str = "") -> str:
+    """Pagina di conferma per eliminare i dati di una caccia spenta o eliminata (mai il file YAML)."""
+    h = e(hunt)
+    flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
+    back = f'<p><a href="/caccia/{quote(hunt)}">Torna alla caccia</a></p>'
+    if state not in DELETABLE:
+        why = {"attiva": "La caccia e' attiva: spegnila prima (<code>attiva: false</code> nel file YAML).",
+               "non_valida": "Il file YAML non e' leggibile, quindi non si sa se la caccia e' spenta.",
+               }.get(state, "Non si riesce a leggere la cartella delle cacce, quindi non si sa se la caccia e' spenta.")
+        return f"<h1>Elimina i dati di {h}</h1>{flash}<div class='empty'>{why}</div>{back}"
+    if status["stato"] != "libero":
+        return (f"<h1>Elimina i dati di {h}</h1>{flash}<div class='empty'>C'e' una richiesta in coda o un giro in "
+                f"corso: aspetta che finisca.</div>{back}")
+    c = {"annunci": conn.execute("SELECT COUNT(*) FROM items WHERE hunt=?", (hunt,)).fetchone()[0],
+         "giri": conn.execute("SELECT COUNT(*) FROM runs WHERE hunt=?", (hunt,)).fetchone()[0],
+         "piani": conn.execute("SELECT COUNT(*) FROM plans WHERE hunt=?", (hunt,)).fetchone()[0]}
+    corretti = conn.execute("SELECT COUNT(*) FROM items WHERE hunt=? AND manual_verdict IS NOT NULL", (hunt,)).fetchone()[0]
+    extra = (f" Tra gli annunci ci sono <b>{corretti}</b> corretti a mano: si perdono anche quelli." if corretti else "")
+    file_note = ("Il file YAML non c'e' piu'." if state == "eliminata"
+                 else "Il file YAML <b>non viene toccato</b>: la caccia resta definita, spenta, e se la riaccendi riparte da zero.")
+    return f"""<h1>Elimina i dati di {h}</h1>{flash}
+<div class="danger"><p>Stai per cancellare dal database <b>{c['annunci']}</b> annunci, <b>{c['giri']}</b> giri e
+<b>{c['piani']}</b> piani di query di <b>{h}</b>.{extra} L'operazione non si puo' annullare.</p>
+<p>{file_note}</p>
+<form class="f" method="post" action="/caccia/{quote(hunt)}/elimina">
+<label>Per confermare scrivi il nome della caccia<input type="text" name="conferma" autocomplete="off"
+placeholder="{h}" required></label>
+<button>Elimina i dati</button> <a href="/caccia/{quote(hunt)}">Annulla</a></form></div>"""
+
+
+def delete_hunt_data(cfg: Config, hunt: str, form: dict[str, list[str]], state: str) -> str:
+    """Elimina i dati di una caccia spenta o eliminata, previa conferma col nome. Ritorna il messaggio."""
+    if state not in DELETABLE:
+        return "Eliminazione non consentita: la caccia non risulta spenta ne' eliminata."
+    if (form.get("conferma") or [""])[-1].strip() != hunt:
+        return "Il nome scritto non corrisponde: non e' stato eliminato nulla."
+    db = DB(cfg.db_path)
+    try:
+        if db.run_in_progress(hunt) or db.request_state(hunt) and db.request_state(hunt)["claimed_at"] is None:
+            return "C'e' una richiesta in coda o un giro in corso: non e' stato eliminato nulla."
+        n = db.delete_hunt_data(hunt)
+    finally:
+        db.close()
+    log.info("web: dati della caccia %s eliminati: %s", hunt, n)
+    return (f"Dati di {hunt} eliminati: {n['annunci']} annunci, {n['giri']} giri, {n['piani']} piani. "
+            f"Il file YAML non e' stato toccato.")
+
+
+def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hunt | None = None,
+                state: str = "attiva") -> tuple[str, int]:
     """Pagina della caccia. Ritorna (corpo, secondi di aggiornamento automatico: 0 = nessuno)."""
     esito = q.get("esito", "verificati") if q.get("esito") in ESITI else "verificati"
     ordina = q.get("ordina", "punteggio") if q.get("ordina") in ORDINI else "punteggio"
@@ -511,8 +628,10 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hu
     actions_form = (f'<form method="post" action="/caccia/{quote(hunt)}/azioni" id="lista">'
                     f'<input type="hidden" name="back" value="{e(back)}">{bulk if rows else ""}{items}</form>')
     rerun, st = render_rerun(conn, hunt, info, q)
+    if state in ("eliminata", "non_valida"):
+        rerun = ""             # senza un file valido il loop non puo' eseguirla
     fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>' for s in (info.fonti if info else []))
-    body = (f"<h1>{e(hunt)}</h1><p class='sub'>{fonti} {e(sub)} · {len(rows)} annunci</p>{msg}{rerun}{form}"
+    body = (f"<h1>{e(hunt)}</h1><p class='sub'>{fonti} {e(sub)} · {len(rows)} annunci</p>{msg}{state_banner(hunt, state)}{rerun}{form}"
             f"{actions_form}{more}{JS}")
     # mentre c'e' una richiesta in coda o un giro in corso la pagina si aggiorna da sola
     return body, (15 if st["stato"] != "libero" else 0)
@@ -654,7 +773,7 @@ def make_handler(cfg: Config):
             if not self._authorized({}) or not self._same_origin():
                 return self._send(403, page("Accesso", '<div class="empty">Azione non consentita.</div>', []))
             parts = [p for p in u.path.split("/") if p]
-            if len(parts) != 3 or parts[0] != "caccia" or parts[2] not in ("azioni", "riesegui"):
+            if len(parts) != 3 or parts[0] != "caccia" or parts[2] not in ("azioni", "riesegui", "elimina"):
                 return self._send(404, "non trovato", "text/plain")
             hunt = parts[1]
             length = min(int(self.headers.get("Content-Length") or 0), 200_000)
@@ -669,6 +788,22 @@ def make_handler(cfg: Config):
                         if conn:
                             conn.close()
                     msg = request_rerun(cfg, hunt, form, names, defs)
+                elif parts[2] == "elimina":
+                    defs, fnames, dir_ok = hunt_files(cfg)
+                    conn = connect(cfg.db_path)
+                    try:
+                        known = hunt in all_hunt_names(conn, defs) if conn else False
+                    finally:
+                        if conn:
+                            conn.close()
+                    if not known:
+                        msg = "Caccia sconosciuta."
+                    else:
+                        msg = delete_hunt_data(cfg, hunt, form, hunt_state(hunt, defs, fnames, dir_ok))
+                    if msg.startswith("Dati di"):
+                        return self._send(303, "", extra={"Location": "/?" + urlencode({"msg": msg})})
+                    return self._send(303, "", extra={"Location": f"/caccia/{quote(hunt)}/elimina?" +
+                                                      urlencode({"msg": msg})})
                 else:
                     msg = apply_action(cfg.db_path, hunt, form)
             except Exception as exc:
@@ -699,16 +834,21 @@ def make_handler(cfg: Config):
                 return self._send(200, page("Scovatore", f'<div class="empty">Database non trovato in '
                                                          f'{e(cfg.db_path)}: la prima caccia non ha ancora girato.</div>', []))
             try:
-                defs = hunt_defs(cfg)
+                defs, fnames, dir_ok = hunt_files(cfg)
                 names = all_hunt_names(conn, defs)
                 parts = [p for p in u.path.split("/") if p]
                 if not parts:
-                    body, names = render_home(conn, defs)
+                    body, names = render_home(conn, defs, fnames, dir_ok, q.get("msg", ""))
                     return self._send(200, page("Cacce", body, names))
+                if len(parts) == 3 and parts[0] == "caccia" and parts[2] == "elimina" and parts[1] in names:
+                    st = hunt_state(parts[1], defs, fnames, dir_ok)
+                    return self._send(200, page("Elimina i dati", render_delete(
+                        conn, parts[1], st, run_status(conn, parts[1]), q.get("msg", "")), names, parts[1]))
                 if parts == ["giri"]:
                     return self._send(200, page("Giri", render_runs(conn), names, "__giri"))
                 if len(parts) == 2 and parts[0] == "caccia" and parts[1] in names:
-                    body, refresh = render_hunt(conn, parts[1], q, cfg.link_domain, defs.get(parts[1]))
+                    body, refresh = render_hunt(conn, parts[1], q, cfg.link_domain, defs.get(parts[1]),
+                                                hunt_state(parts[1], defs, fnames, dir_ok))
                     return self._send(200, page(parts[1], body, names, parts[1], refresh))
                 if len(parts) == 3 and parts[:2] == ["api", "caccia"] and parts[2] in names:
                     return self._send(200, json.dumps(api_items(conn, parts[2], q, cfg.link_domain), ensure_ascii=False),

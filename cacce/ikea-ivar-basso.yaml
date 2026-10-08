@@ -1,6 +1,7 @@
 nome: ikea-ivar-basso
 attiva: true
 ogni_minuti: 180
+fonti: [ebay, vinted, subito]   # ricerche attive; i prezzi di Vinted e Subito seguono prezzo_max di ebay
 
 ebay:
   marketplaces: [EBAY_IT]

@@ -1,6 +1,7 @@
 nome: lego-lotti-sfusi
 attiva: true
 ogni_minuti: 90
+fonti: [ebay, vinted, subito]   # ricerche attive; i prezzi di Vinted e Subito seguono prezzo_max di ebay
 
 ebay:
   marketplaces: [EBAY_IT, EBAY_DE, EBAY_FR, EBAY_ES]
