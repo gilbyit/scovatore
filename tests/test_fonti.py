@@ -25,10 +25,12 @@ from test_scovatore import FakeEbay, FakeLLM, env, make_clients  # noqa: F401  (
 
 # ---------------------------------------------------------------- finti Vinted e Subito
 def vinted_item(iid, title, price, total=None, **kw):
+    # forma della risposta di api.vinted.<paese>/svc-catalogue/items (da settembre 2026): URL relativo,
+    # marca e "taglia · stato" dentro item_box
     d = {"id": iid, "title": title, "price": {"amount": str(price), "currency_code": "EUR"},
-         "url": f"https://www.vinted.it/items/{iid}-x", "photo": {"url": f"https://img.example/{iid}.jpg"},
+         "url": f"/items/{iid}-x", "photo": {"url": f"https://img.example/{iid}.jpg"},
          "user": {"login": "marco", "feedback_reputation": 0.98, "feedback_count": 12},
-         "status": "Buone condizioni", "brand_title": "Marantz", "size_title": ""}
+         "item_box": {"first_line": "Marantz", "second_line": "M · Buone condizioni"}}
     if total is not None:
         d["total_item_price"] = {"amount": str(total), "currency_code": "EUR"}
     d.update(kw)
@@ -43,32 +45,39 @@ VINTED_CATALOG = [
 
 
 class FakeVinted:
-    def __init__(self, items=None, home_status=200, cookie=True, expire_first=False):
+    """Vinted come oggi: HEAD www/catalog rilascia il token (prima un cookie vuoto che cancella, poi quello
+    vero), api.vinted.it/svc-catalogue/items vuole `Authorization: Bearer`, il vecchio endpoint non c'e' piu'."""
+
+    def __init__(self, items=None, home_status=200, cookie=True, expire_first=False, expire_status=401):
         self.items = VINTED_CATALOG if items is None else items
         self.home_status, self.cookie, self.expire_first = home_status, cookie, expire_first
-        self.requests = []          # (path, query)
+        self.expire_status = expire_status
+        self.requests = []          # (host, path, query)
         self.homes = 0
         self.pages = 0
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
-        self.requests.append((req.url.path, str(req.url.query, "ascii")))
-        if req.url.path == "/":
+        host, path = req.url.host, req.url.path
+        self.requests.append((host, path, str(req.url.query, "ascii")))
+        if host.startswith("www.") and path == "/catalog" and req.method == "HEAD":
             self.homes += 1
             if self.home_status != 200:
                 return httpx.Response(self.home_status, text="blocked")
-            headers = {"set-cookie": f"access_token_web=tok{self.homes}; Path=/"} if self.cookie else {}
-            return httpx.Response(200, text="<html></html>", headers=headers)
-        if req.url.path == "/api/v2/catalog/items":
-            if "access_token_web" not in req.headers.get("cookie", ""):
-                return httpx.Response(401, json={"message": "unauthorized"})
-            if self.expire_first and self.homes == 1:        # il primo cookie risulta scaduto
-                return httpx.Response(401, json={"message": "expired"})
+            cookies = [("set-cookie", "access_token_web=; Max-Age=-1; Domain=.www.vinted.it"),
+                       ("set-cookie", f"access_token_web=tok{self.homes}; Max-Age=604800; Domain=.vinted.it")]
+            return httpx.Response(200, headers=httpx.Headers(cookies if self.cookie else []))
+        if host.startswith("api.") and path == "/svc-catalogue/items":
+            auth = req.headers.get("authorization", "")
+            if not auth.startswith("Bearer tok"):
+                return httpx.Response(403, json={"code": "FORBIDDEN", "message": "Access denied."})
+            if self.expire_first and auth == "Bearer tok1":          # il primo token risulta scaduto
+                return httpx.Response(self.expire_status, json={"message": "expired"})
             return httpx.Response(200, json={"items": self.items, "pagination": {}})
-        if req.url.path.startswith("/items/"):
+        if host.startswith("www.") and path.startswith("/items/"):
             self.pages += 1
             ld = json.dumps({"@type": "Product", "description": "Si accende ma non da' suono, vendo per ricambi"})
             return httpx.Response(200, text=f'<html><head><script type="application/ld+json">{ld}</script></head></html>')
-        return httpx.Response(404)
+        return httpx.Response(404)           # compreso il vecchio www.vinted.it/api/v2/catalog/items
 
 
 def subito_ad(aid, title, price, **kw):
@@ -226,11 +235,15 @@ def test_vinted_search_cookie_prezzi_e_parametri():
     assert a.source == "vinted" and a.price == 42.45 and a.currency == "EUR"   # totale con protezione acquirenti
     assert a.shipping is None and a.url == "https://www.vinted.it/items/111-x"
     assert a.seller_feedback_pct == pytest.approx(98) and a.aspects["Marca"] == "Marantz"
-    path, query = fake.requests[-1]
-    assert path == "/api/v2/catalog/items"
-    for part in ("search_text=amplificatore", "price_to=100", "order=newest_first", "status_ids%5B%5D=2",
-                 "status_ids%5B%5D=3", "catalog%5B%5D=2050"):
+    host, path, query = fake.requests[-1]
+    assert (host, path) == ("api.vinted.it", "/svc-catalogue/items")       # host dedicato, non piu' www/api/v2
+    for part in ("search_text=amplificatore", "price_to=100", "order=newest_first",
+                 "attribute_ids%5Bstatus%5D=2%2C3", "attribute_ids%5Bcatalog%5D=2050"):
         assert part in query, part
+    for vecchio in ("status_ids", "catalog%5B%5D", "currency"):            # parametri che il sito ignora o rifiuta
+        assert vecchio not in query, vecchio
+    assert "price_from" not in query                                        # un prezzo vuoto darebbe 400
+    assert a.aspects == {"Marca": "Marantz", "Taglia": "M", "Stato": "Buone condizioni"} and a.condition == "Buone condizioni"
     src.search("amplificatore", "it", h)
     assert fake.homes == 1                                   # il cookie si riusa
 
@@ -241,11 +254,42 @@ def test_vinted_spedizione_stimata_nel_totale():
     assert found[0].shipping == 5 and found[0].total == 45
 
 
-def test_vinted_rinnova_sessione_su_401():
+@pytest.mark.parametrize("status", [401, 403])
+def test_vinted_rinnova_il_token_su_401_e_403(status):
     h = parse_hunt(MULTI)
-    fake = FakeVinted(expire_first=True)
+    fake = FakeVinted(expire_first=True, expire_status=status)
     found = vinted_src(h, fake).search("amplificatore", "it", h)
     assert fake.homes == 2 and len(found) == 3
+
+
+def test_vinted_token_ultimo_non_vuoto_e_nessun_token():
+    h = parse_hunt(MULTI)
+    fake = FakeVinted()
+    vinted_src(h, fake).search("x", "it", h)          # il primo set-cookie e' vuoto: si usa il secondo
+    assert fake.homes == 1
+    with pytest.raises(SourceError, match="token di sessione"):
+        vinted_src(h, FakeVinted(cookie=False)).search("x", "it", h)
+
+
+def test_vinted_endpoint_cambiato_di_nuovo_non_sembra_vuoto():
+    h = parse_hunt(MULTI)
+    src = vinted_src(h, FakeVinted())
+    src.http = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(404) if r.url.host.startswith("api.") else httpx.Response(
+            200, headers=httpx.Headers([("set-cookie", "access_token_web=t; Max-Age=60")]))))
+    with pytest.raises(SourceError, match="404"):
+        src.search("x", "it", h)
+
+
+def test_vinted_403_anche_col_token_nuovo_e_blocco():
+    h = parse_hunt(MULTI)
+    src = vinted_src(h, FakeVinted())
+    src.http = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(403, json={"code": "FORBIDDEN"}) if r.url.host.startswith("api.") else httpx.Response(
+            200, headers=httpx.Headers([("set-cookie", "access_token_web=t; Max-Age=60")]))))
+    with pytest.raises(SourceError) as e:
+        src.search("x", "it", h)
+    assert e.value.blocked
 
 
 def test_vinted_blocco_e_formato_cambiato():
@@ -337,7 +381,8 @@ def test_pipeline_tre_fonti(env):
     assert '"fonte": "Vinted"' in prompt and "ricambi" in prompt
     assert all('"fonte"' not in p for p in x.llm.verify_prompts if "Xeon" in p)   # eBay: payload invariato
     # query solo nella lingua del sito: Vinted.it e Subito non ricevono le query tedesche o inglesi
-    assert all("x79+mainboard" not in q and "motherboard" not in q for _, q in x.vinted.requests + x.subito.requests)
+    assert all("x79+mainboard" not in q and "motherboard" not in q
+               for q in [r[-1] for r in x.vinted.requests] + [r[-1] for r in x.subito.requests])
     db.close()
 
 
