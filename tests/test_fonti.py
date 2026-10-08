@@ -564,21 +564,24 @@ def test_web_pulsante_riesegui(servizio):
             # la caccia definita nel YAML compare anche senza annunci, con le sue fonti e il pulsante
             home = c.get("/").text
             assert "multi" in home and "Vinted" in home and "Subito" in home
-            page = c.get("/caccia/multi")
-            assert page.status_code == 200 and "Riesegui ora" in page.text
-            assert "Vinted soltanto" in page.text and "Subito soltanto" in page.text and "eBay soltanto" in page.text
+            # il pulsante sta nella pagina Giri, non piu' in quella della caccia
+            assert "Riesegui" not in c.get("/caccia/multi").text
+            page = c.get("/giri")
+            assert page.status_code == 200 and "Riesegui</button>" in page.text and 'action="/caccia/multi/riesegui"' in page.text
+            assert ">Vinted</option>" in page.text and ">Subito</option>" in page.text and ">eBay</option>" in page.text
             assert " disabled" not in page.text and 'http-equiv="refresh"' not in page.text
 
-            r = c.post("/caccia/multi/riesegui", data={"fonte": "vinted", "rigenera_piano": "1", "back": "esito=tutti"})
-            assert r.status_code == 303 and "msg=" in r.headers["location"] and "esito=tutti" in r.headers["location"]
+            r = c.post("/caccia/multi/riesegui", data={"fonte": "vinted", "rigenera_piano": "1", "da": "giri"})
+            assert r.status_code == 303 and r.headers["location"].startswith("/giri?msg=")
             db = DB(cfg.db_path)
             req = db.pending_requests()[0]
             assert req["hunt"] == "multi" and req["fonti"] == "vinted" and req["rigenera_piano"] == 1
             db.close()
 
             # in coda: pulsante disattivato, stato visibile, pagina che si aggiorna da sola
-            page = c.get("/caccia/multi").text
+            page = c.get("/giri").text
             assert "in coda" in page and " disabled" in page and 'http-equiv="refresh"' in page
+            assert "in coda" in c.get("/caccia/multi").text
             assert "in coda" in c.get("/").text
 
             # seconda richiesta mentre la prima e' in attesa: non si accoda
@@ -635,7 +638,7 @@ def test_web_stato_in_corso_e_filtro_per_fonte(servizio):
 
             # giro in corso: pulsante disattivato
             db.start_run("multi")
-            assert " disabled" in c.get("/caccia/multi").text and "Giro in corso" in c.get("/caccia/multi").text
+            assert " disabled" in c.get("/giri").text and "Giro in corso" in c.get("/caccia/multi").text
 
             # azioni sugli ID con prefisso: l'ID viene accettato, quello sporco no
             c.post("/caccia/multi/azioni", data={"azione": "elimina:vinted:111"})
@@ -715,10 +718,15 @@ def test_web_mostra_cacce_spente_ed_eliminate(servizio):
             assert "Spente" in home and "Eliminate" in home
             assert home.index("Spente") < home.index("Eliminate")
             # i tre stati sono distinti: la caccia con il file rotto NON si dichiara eliminata
-            assert 'chip off">eliminata' in home and 'chip off">spenta' in home and "file non valido" in home
+            assert 'chip st-eliminata">eliminata' in home and 'chip st-spenta">spenta' in home and "file non valido" in home
+            # colpo d'occhio: colori diversi per stato e pulsante di eliminazione gia' nella home
+            assert 'class="card st-spenta"' in home and 'class="card st-eliminata"' in home and 'class="card st-attiva"' in home
+            assert 'href="/caccia/spenta/elimina"' in home and 'href="/caccia/fantasma/elimina"' in home
+            assert 'href="/caccia/multi/elimina"' not in home and 'href="/caccia/rotta/elimina"' not in home
             assert c.get("/caccia/fantasma").text.count("Caccia eliminata") == 1
-            assert "Riesegui ora" not in c.get("/caccia/fantasma").text          # senza file non si puo' rieseguire
-            assert "Caccia spenta" in c.get("/caccia/spenta").text and "Riesegui ora" in c.get("/caccia/spenta").text
+            giri = c.get("/giri").text
+            assert 'action="/caccia/fantasma/riesegui"' not in giri               # senza file non si puo' rieseguire
+            assert "Caccia spenta" in c.get("/caccia/spenta").text and 'action="/caccia/spenta/riesegui"' in giri
             assert "Elimina i dati" in c.get("/caccia/spenta").text
             assert "Elimina i dati" not in c.get("/caccia/multi").text           # la attiva non si puo'
             assert "Elimina i dati" not in c.get("/caccia/rotta").text
@@ -733,7 +741,7 @@ def test_web_senza_cartella_cacce_non_dice_eliminata(servizio):
     srv, base = _serve(replace(cfg, hunts_dir=cfg.hunts_dir / "non-montata"))
     try:
         with httpx.Client(base_url=base) as c:
-            assert "eliminata" not in c.get("/").text and "Eliminate" not in c.get("/").text
+            assert 'chip st-eliminata' not in c.get("/").text and "Eliminate" not in c.get("/").text
             r = c.post("/caccia/multi/elimina", data={"conferma": "multi"})
             assert r.status_code == 303
             assert db.hunt_counts("multi")["annunci"] > 0             # cartella assente: non si cancella nulla
@@ -818,3 +826,25 @@ def test_cacce_del_repo_attivano_tutte_le_fonti():
     from scovatore.hunt import load_all
     hunts = load_all(Path(__file__).resolve().parent.parent / "cacce")
     assert hunts and all(set(h.fonti) == {"ebay", "vinted", "subito"} for h in hunts)
+
+
+def test_giri_pulsante_solo_sulla_riga_piu_recente(servizio):
+    cfg, _ = servizio
+    old = DB(cfg.db_path)                                # prima un giro vecchio, poi quello di oggi (id piu' alto)
+    old.conn.execute("INSERT INTO runs(hunt, started_at, finished_at, stats_json) VALUES "
+                     "('multi','2020-01-01T00:00:00','2020-01-01T00:01:00','{}')")
+    old.conn.commit()
+    old.close()
+    db = _popola(cfg)
+    ids = [r[0] for r in db.conn.execute("SELECT id FROM runs WHERE hunt='multi' ORDER BY id DESC")]
+    assert len(ids) == 2
+    srv, base = _serve(cfg)
+    try:
+        with httpx.Client(base_url=base) as c:
+            rows = [r for r in c.get("/giri").text.split("<tr>")[2:]]      # 0 = prima della tabella, 1 = intestazione
+            assert len(rows) == 2
+            assert f"<td>{ids[0]}</td>" in rows[0] and 'action="/caccia/multi/riesegui"' in rows[0]
+            assert f"<td>{ids[1]}</td>" in rows[1] and "riesegui" not in rows[1]
+    finally:
+        srv.shutdown()
+        db.close()

@@ -283,7 +283,7 @@ td,th{border-bottom:1px solid var(--line);padding:5px 6px;text-align:left;vertic
 th{color:var(--muted);font-weight:600}.ok{color:var(--hi)}.ko{color:var(--lo)}.dub{color:var(--mid)}
 ul.small{margin:4px 0 0 18px;padding:0;font-size:13px}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin:18px 0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px}
 .card h2{font-size:16px;margin:0 0 8px}.nums{display:flex;gap:16px;margin:6px 0}.nums b{display:block;font-size:20px}
 .nums span{font-size:12px;color:var(--muted)}.err{color:var(--lo);font-size:13px}
 .empty{padding:30px;text-align:center;color:var(--muted)}
@@ -304,6 +304,17 @@ form.f label.chk{flex-direction:row;align-items:center;gap:6px;font-size:13px}
 button:disabled{opacity:.45;cursor:not-allowed}
 .chip.run{background:var(--mid);color:var(--card)}
 .chip.off{background:var(--line);color:var(--muted)}
+.card{padding:0;overflow:hidden}.cardlink{display:block;padding:14px;text-decoration:none;color:inherit}
+.card.st-spenta{border-left:5px solid var(--mid);background:color-mix(in srgb,var(--mid) 13%,var(--card))}
+.card.st-eliminata{border-left:5px solid var(--lo);background:color-mix(in srgb,var(--lo) 13%,var(--card))}
+.card.st-non_valida{border-left:5px solid var(--muted);background:color-mix(in srgb,var(--muted) 12%,var(--card))}
+.chip.st-spenta{background:var(--mid);color:var(--card)}.chip.st-eliminata{background:var(--lo);color:var(--card)}
+.cardact{padding:0 14px 12px}
+a.btn{display:inline-block;font-size:12px;padding:4px 10px;border-radius:6px;text-decoration:none;
+border:1px solid var(--lo);color:var(--lo);background:var(--card)}a.btn:hover{background:var(--lo);color:var(--card)}
+form.mini{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}form.mini select{font-size:12px;padding:3px 5px}
+form.mini label{font-size:12px;color:var(--muted);display:flex;gap:3px;align-items:center}
+form.mini button{font-size:12px;padding:4px 10px}
 h2.grp{font-size:15px;margin:22px 0 -6px}
 .danger{border:1px solid var(--lo,#c0392b);border-radius:10px;padding:14px;margin:14px 0}
 @media (max-width:640px){.item{grid-template-columns:64px 1fr}.thumb{width:64px;height:64px}
@@ -357,7 +368,7 @@ def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] 
     for h in hs:
         state = hunt_state(h["hunt"], defs, file_names, dir_ok)
         label, cls = STATE_CHIP.get(state, ("", ""))
-        state_chip = f'<span class="chip {cls}">{label}</span>' if label else ""
+        state_chip = f'<span class="chip st-{state}">{label}</span>' if label else ""
         fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>'
                         for s in (defs[h["hunt"]].fonti if h["hunt"] in defs else []))
         st = run_status(conn, h["hunt"])
@@ -376,13 +387,15 @@ def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] 
             elif r["stats"].get("errori"):
                 n = len(r["stats"]["errori"])
                 err = f'<div class="err">{n} error{"e" if n == 1 else "i"} nell\'ultimo giro: {e(r["stats"]["errori"][0][:120])}</div>'
-        cards["eliminata" if state == "eliminata" else "spenta" if state in ("spenta", "non_valida") else "attiva"].append(f"""<a class="card" href="/caccia/{quote(h['hunt'])}" style="text-decoration:none;color:inherit">
+        delete = (f'<div class="cardact"><a class="btn" href="/caccia/{quote(h["hunt"])}/elimina">'
+                  f'Elimina dati...</a></div>' if state in DELETABLE else "")
+        cards["eliminata" if state == "eliminata" else "spenta" if state in ("spenta", "non_valida") else "attiva"].append(f"""<div class="card st-{state}"><a class="cardlink" href="/caccia/{quote(h['hunt'])}">
 <h2>{e(h['hunt'])}</h2><div class="meta" style="margin:-4px 0 6px">{state_chip}{fonti}{stato}</div>
 <div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
 <div><b>{h['verificati'] or 0}</b><span>verificati</span></div><div><b>{h['attesa'] or 0}</b><span>in attesa</span></div>
 <div><b>{h['totale']}</b><span>visti</span></div></div>
 {f'<div class="meta">{h["eliminati"]} eliminati a mano</div>' if h.get("eliminati") else ''}
-<div class="meta">{e(run_line)} · ultimo annuncio nuovo {e(ago(h['ultimo_nuovo']))}</div>{err}</a>""")
+<div class="meta">{e(run_line)} · ultimo annuncio nuovo {e(ago(h['ultimo_nuovo']))}</div>{err}</a>{delete}</div>""")
     out = [f"<h1>Cacce</h1>{flash}"]
     titles = {"attiva": None,
               "spenta": "Spente <span class='meta'>(attiva: false nel file YAML: non girano da sole)</span>",
@@ -488,35 +501,36 @@ def render_item(r: sqlite3.Row, link_domain: str = "ebay.it") -> str:
 <div class="meta">{badge}{e(esito)}</div></div></div>"""
 
 
-def render_rerun(conn, hunt: str, info: Hunt | None, q: dict) -> tuple[str, dict]:
-    """Riquadro con il pulsante "Riesegui ora" e lo stato (in coda / in corso) della caccia."""
+def rerun_cell(conn, hunt: str, info: Hunt | None, state: str) -> tuple[str, bool]:
+    """Pulsante "Riesegui" compatto per la riga di una caccia nella pagina Giri. Ritorna (html, occupata)."""
+    if state in ("eliminata", "non_valida", "ignota") or info is None:
+        return '<span class="meta">non eseguibile</span>', False
     st = run_status(conn, hunt)
     busy = st["stato"] != "libero"
-    fonti = info.fonti if info else []
-    opts = '<option value="">Tutte le fonti della caccia</option>' + "".join(
-        f'<option value="{s}">{e(SOURCE_LABELS[s])} soltanto</option>' for s in fonti if len(fonti) > 1)
+    fonti = info.fonti
+    sel = ""
+    if len(fonti) > 1:
+        sel = ('<select name="fonte" title="Cosa rieseguire"><option value="">Tutte le fonti</option>' +
+               "".join(f'<option value="{s}">{e(SOURCE_LABELS[s])}</option>' for s in fonti) + "</select>")
     if st["stato"] == "coda":
-        note = (f"Richiesta {ago(st['dal'])}, in coda: parte entro {POLL_HINT} secondi se il servizio e' libero, "
-                f"altrimenti appena finisce il giro in corso.")
+        note = f"in coda, {e(ago(st['dal']))}"
     elif st["stato"] == "corso":
-        note = f"Giro in corso da {ago(st['dal']).replace(' fa', '')}."
+        note = "giro in corso"
     elif st.get("errore"):
-        note = f"L'ultima riesecuzione e' fallita: {st['errore'][:200]}"
+        note = f"ultima richiesta fallita: {e(st['errore'][:120])}"
     else:
-        note = "Ignora l'intervallo di ricerca automatico e parte subito."
-    back = urlencode({k: v for k, v in q.items() if k not in ("msg", "token")})
-    form = f"""<form class="f" method="post" action="/caccia/{quote(hunt)}/riesegui">
-<input type="hidden" name="back" value="{e(back)}">
-<label>Cosa rieseguire<select name="fonte">{opts}</select></label>
-<label class="chk"><input type="checkbox" name="rigenera_piano" value="1"> Rigenera le query con l'LLM</label>
-<button{' disabled' if busy else ''}>Riesegui ora</button><span class="meta">{e(note)}</span></form>"""
-    return form, st
+        note = ""
+    form = f"""<form class="mini" method="post" action="/caccia/{quote(hunt)}/riesegui">
+<input type="hidden" name="da" value="giri">{sel}
+<label title="Rigenera le query con l'LLM"><input type="checkbox" name="rigenera_piano" value="1">query</label>
+<button{' disabled' if busy else ''}>Riesegui</button></form>{f'<div class="meta">{note}</div>' if note else ''}"""
+    return form, busy
 
 
 def state_banner(hunt: str, state: str) -> str:
     """Avviso in cima alla pagina di una caccia spenta o eliminata, col link per eliminarne i dati."""
     if state == "spenta":
-        txt = "Caccia spenta (<code>attiva: false</code>): non gira da sola, ma si puo' rieseguire a mano."
+        txt = "Caccia spenta (<code>attiva: false</code>): non gira da sola, ma si puo' rieseguire a mano dalla pagina <a href='/giri'>Giri</a>."
     elif state == "eliminata":
         txt = "Caccia eliminata: il file YAML non c'e' piu', restano i dati nel database. Non si puo' rieseguire."
     elif state == "non_valida":
@@ -627,9 +641,12 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hu
 <button name="multipla" value="1">Applica ai selezionati</button></div>"""
     actions_form = (f'<form method="post" action="/caccia/{quote(hunt)}/azioni" id="lista">'
                     f'<input type="hidden" name="back" value="{e(back)}">{bulk if rows else ""}{items}</form>')
-    rerun, st = render_rerun(conn, hunt, info, q)
-    if state in ("eliminata", "non_valida"):
-        rerun = ""             # senza un file valido il loop non puo' eseguirla
+    st = run_status(conn, hunt)
+    rerun = ""
+    if st["stato"] == "coda":
+        rerun = f"<div class='flash'>Riesecuzione richiesta {e(ago(st['dal']))}, in coda.</div>"
+    elif st["stato"] == "corso":
+        rerun = f"<div class='flash'>Giro in corso da {e(ago(st['dal']).replace(' fa', ''))}.</div>"
     fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>' for s in (info.fonti if info else []))
     body = (f"<h1>{e(hunt)}</h1><p class='sub'>{fonti} {e(sub)} · {len(rows)} annunci</p>{msg}{state_banner(hunt, state)}{rerun}{form}"
             f"{actions_form}{more}{JS}")
@@ -637,11 +654,23 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hu
     return body, (15 if st["stato"] != "libero" else 0)
 
 
-def render_runs(conn) -> str:
+def render_runs(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] | None = None,
+                dir_ok: bool = False, msg: str = "") -> tuple[str, int]:
+    """Pagina Giri: gli ultimi giri di tutte le cacce. Sulla riga piu' recente di ogni caccia c'e' il
+    pulsante "Riesegui". Ritorna (corpo, secondi di aggiornamento automatico)."""
+    defs = defs or {}
+    flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
     runs = recent_runs(conn)
-    if not runs:
-        return '<div class="empty">Nessun giro registrato.</div>'
+    seen: set[str] = set()
+    busy_any = False
     rows = []
+
+    def action(hunt: str) -> str:
+        nonlocal busy_any
+        cell, busy = rerun_cell(conn, hunt, defs.get(hunt), hunt_state(hunt, defs, file_names, dir_ok))
+        busy_any = busy_any or busy
+        return cell
+
     for r in runs:
         st = r["stats"]
         dur = st.get("durate", {}).get("totale")
@@ -651,15 +680,27 @@ def render_runs(conn) -> str:
         errs = st.get("errori") or []
         err_html = f"<details><summary>{len(errs)} errori</summary><ul class='small'>" + \
             "".join(f"<li>{e(x[:300])}</li>" for x in errs) + "</ul></details>" if errs else ""
+        first = r["hunt"] not in seen            # i giri arrivano dal piu' recente: il primo di ogni caccia
+        seen.add(r["hunt"])
         rows.append(f"""<tr><td>{r['id']}</td><td>{e(r['hunt'])}</td><td>{e(ago(r['started_at']))}</td>
 <td class="{cls}">{stato}</td><td>{'' if dur is None else f'{dur:.0f} s'}<div class="meta">{e(fasi)}</div></td>
 <td>{st.get('query', '')}</td><td>{st.get('unici', '')}</td><td>{st.get('scartati_filtri', '')}</td>
 <td>{st.get('nuovi', '')}</td><td>{st.get('scremati', '')}</td><td>{st.get('verificati', '')}</td>
-<td>{st.get('conformi', '')}</td><td>{st.get('chiamate_ebay', '')}</td><td>{err_html}</td></tr>""")
-    return f"""<h1>Giri recenti</h1><p class="sub">Ultimi {len(runs)} giri di tutte le cacce.</p>
+<td>{st.get('conformi', '')}</td><td>{st.get('chiamate_ebay', '')}</td><td>{err_html}</td>
+<td>{action(r['hunt']) if first else ''}</td></tr>""")
+    for name in sorted(defs):                    # cacce che non hanno giri nell'elenco: si possono comunque avviare
+        if name not in seen:
+            rows.append(f"""<tr><td></td><td>{e(name)}</td><td colspan="12" class="meta">nessun giro recente</td>
+<td>{action(name)}</td></tr>""")
+    if not rows:
+        return flash + '<div class="empty">Nessun giro registrato.</div>', 0
+    body = f"""<h1>Giri recenti</h1>{flash}<p class="sub">Ultimi {len(runs)} giri di tutte le cacce. "Riesegui" sulla riga
+piu' recente di una caccia la fa partire subito, senza aspettare l'intervallo (anche se e' spenta). Parte entro
+{POLL_HINT} secondi se il servizio e' libero.</p>
 <div class="scroll"><table><tr><th>#</th><th>Caccia</th><th>Avvio</th><th>Stato</th><th>Durata</th><th>Ricerche</th>
 <th>Unici</th><th>Scartati</th><th>Nuovi</th><th>Scremati</th><th>Verificati</th><th>Conformi</th><th>eBay</th>
-<th>Errori</th></tr>{''.join(rows)}</table></div>"""
+<th>Errori</th><th>Azione</th></tr>{''.join(rows)}</table></div>"""
+    return body, (15 if busy_any else 0)
 
 
 def apply_action(db_path: Path, hunt: str, form: dict[str, list[str]]) -> str:
@@ -809,6 +850,8 @@ def make_handler(cfg: Config):
             except Exception as exc:
                 log.exception("azione web fallita su %s", hunt)
                 msg = f"Errore: {exc}"
+            if (form.get("da") or [""])[-1] == "giri":
+                return self._send(303, "", extra={"Location": "/giri?" + urlencode({"msg": msg})})
             back = dict(parse_qs((form.get("back") or [""])[-1]))
             q = {k: v[-1] for k, v in back.items()}
             q["msg"] = msg
@@ -845,7 +888,8 @@ def make_handler(cfg: Config):
                     return self._send(200, page("Elimina i dati", render_delete(
                         conn, parts[1], st, run_status(conn, parts[1]), q.get("msg", "")), names, parts[1]))
                 if parts == ["giri"]:
-                    return self._send(200, page("Giri", render_runs(conn), names, "__giri"))
+                    body, refresh = render_runs(conn, defs, fnames, dir_ok, q.get("msg", ""))
+                    return self._send(200, page("Giri", body, names, "__giri", refresh))
                 if len(parts) == 2 and parts[0] == "caccia" and parts[1] in names:
                     body, refresh = render_hunt(conn, parts[1], q, cfg.link_domain, defs.get(parts[1]),
                                                 hunt_state(parts[1], defs, fnames, dir_ok))
