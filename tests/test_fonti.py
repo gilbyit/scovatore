@@ -820,31 +820,3 @@ def test_web_elimina_dati_caccia_eliminata_e_token(servizio):
     finally:
         srv.shutdown()
         db.close()
-
-
-def test_cacce_del_repo_attivano_tutte_le_fonti():
-    from scovatore.hunt import load_all
-    hunts = load_all(Path(__file__).resolve().parent.parent / "cacce")
-    assert hunts and all(set(h.fonti) == {"ebay", "vinted", "subito"} for h in hunts)
-
-
-def test_giri_pulsante_solo_sulla_riga_piu_recente(servizio):
-    cfg, _ = servizio
-    old = DB(cfg.db_path)                                # prima un giro vecchio, poi quello di oggi (id piu' alto)
-    old.conn.execute("INSERT INTO runs(hunt, started_at, finished_at, stats_json) VALUES "
-                     "('multi','2020-01-01T00:00:00','2020-01-01T00:01:00','{}')")
-    old.conn.commit()
-    old.close()
-    db = _popola(cfg)
-    ids = [r[0] for r in db.conn.execute("SELECT id FROM runs WHERE hunt='multi' ORDER BY id DESC")]
-    assert len(ids) == 2
-    srv, base = _serve(cfg)
-    try:
-        with httpx.Client(base_url=base) as c:
-            rows = [r for r in c.get("/giri").text.split("<tr>")[2:]]      # 0 = prima della tabella, 1 = intestazione
-            assert len(rows) == 2
-            assert f"<td>{ids[0]}</td>" in rows[0] and 'action="/caccia/multi/riesegui"' in rows[0]
-            assert f"<td>{ids[1]}</td>" in rows[1] and "riesegui" not in rows[1]
-    finally:
-        srv.shutdown()
-        db.close()

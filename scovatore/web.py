@@ -21,7 +21,8 @@ from .config import Config
 from .db import DB, MANUAL_VERDICTS, STALE_RUN_HOURS
 import yaml
 
-from .hunt import SOURCE_LABELS, SOURCES, Hunt, load_hunt
+from . import huntfiles
+from .hunt import SOURCE_LABELS, SOURCES, Hunt, load_hunt, slug
 
 log = logging.getLogger(__name__)
 
@@ -136,9 +137,9 @@ def hunt_files(cfg: Config) -> tuple[dict[str, Hunt], set[str], bool]:
     for p in files:
         try:
             data = yaml.safe_load(p.read_text(encoding="utf-8"))
-            names.add(str(data.get("nome")) if isinstance(data, dict) and data.get("nome") else p.stem)
+            names.add(slug(str(data.get("nome") or p.stem)) if isinstance(data, dict) else slug(p.stem))
         except Exception:
-            names.add(p.stem)
+            names.add(slug(p.stem))
     return defs, names, ok
 
 
@@ -315,6 +316,13 @@ border:1px solid var(--lo);color:var(--lo);background:var(--card)}a.btn:hover{ba
 form.mini{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}form.mini select{font-size:12px;padding:3px 5px}
 form.mini label{font-size:12px;color:var(--muted);display:flex;gap:3px;align-items:center}
 form.mini button{font-size:12px;padding:4px 10px}
+.cardact{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.cardact form{margin:0}
+a.btn.n{color:var(--ink);border-color:var(--line)}a.btn.n:hover{background:var(--chip);color:var(--ink)}
+button.btn{font-size:12px;padding:4px 10px;background:var(--card);color:var(--ink);border:1px solid var(--line)}
+button.btn:hover{background:var(--chip)}
+textarea.code{width:100%;box-sizing:border-box;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:10px;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);tab-size:2;white-space:pre}
+.err{color:var(--lo)}.flash.bad{border-left-color:var(--lo)}
 h2.grp{font-size:15px;margin:22px 0 -6px}
 .danger{border:1px solid var(--lo,#c0392b);border-radius:10px;padding:14px;margin:14px 0}
 @media (max-width:640px){.item{grid-template-columns:64px 1fr}.thumb{width:64px;height:64px}
@@ -353,11 +361,14 @@ def all_hunt_names(conn, defs: dict[str, Hunt]) -> list[str]:
 
 
 def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] | None = None,
-                dir_ok: bool = False, msg: str = "") -> tuple[str, list[str]]:
+                dir_ok: bool = False, msg: str = "", can_edit: bool = False) -> tuple[str, list[str]]:
     defs = defs or {}
     flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
     by_name = {h["hunt"]: h for h in hunts_overview(conn)}
     for n in defs:   # caccia definita ma mai girata: compare lo stesso, con i contatori a zero
+        by_name.setdefault(n, {"hunt": n, "totale": 0, "verificati": 0, "conformi": 0, "attesa": 0,
+                               "eliminati": 0, "ultimo_nuovo": None, "ultimo_giro": last_run(conn, n)})
+    for n in (file_names or ()):   # file YAML rotto e mai girato: va comunque visibile, per poterlo correggere
         by_name.setdefault(n, {"hunt": n, "totale": 0, "verificati": 0, "conformi": 0, "attesa": 0,
                                "eliminati": 0, "ultimo_nuovo": None, "ultimo_giro": last_run(conn, n)})
     hs = [by_name[n] for n in sorted(by_name)]
@@ -387,8 +398,17 @@ def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] 
             elif r["stats"].get("errori"):
                 n = len(r["stats"]["errori"])
                 err = f'<div class="err">{n} error{"e" if n == 1 else "i"} nell\'ultimo giro: {e(r["stats"]["errori"][0][:120])}</div>'
-        delete = (f'<div class="cardact"><a class="btn" href="/caccia/{quote(h["hunt"])}/elimina">'
-                  f'Elimina dati...</a></div>' if state in DELETABLE else "")
+        q_h = quote(h["hunt"])
+        acts = []
+        if state in ("attiva", "spenta", "non_valida") and (file_names is not None):
+            acts.append(f'<a class="btn n" href="/caccia/{q_h}/file">{"Modifica" if can_edit else "Vedi file"}</a>')
+        if can_edit and state in ("attiva", "spenta"):
+            nuovo, lab = ("0", "Spegni") if state == "attiva" else ("1", "Accendi")
+            acts.append(f'<form method="post" action="/caccia/{q_h}/attiva"><input type="hidden" name="valore" '
+                        f'value="{nuovo}"><button class="btn">{lab}</button></form>')
+        if state in DELETABLE:
+            acts.append(f'<a class="btn" href="/caccia/{q_h}/elimina">Elimina dati...</a>')
+        delete = f'<div class="cardact">{"".join(acts)}</div>' if acts else ""
         cards["eliminata" if state == "eliminata" else "spenta" if state in ("spenta", "non_valida") else "attiva"].append(f"""<div class="card st-{state}"><a class="cardlink" href="/caccia/{quote(h['hunt'])}">
 <h2>{e(h['hunt'])}</h2><div class="meta" style="margin:-4px 0 6px">{state_chip}{fonti}{stato}</div>
 <div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
@@ -396,7 +416,8 @@ def render_home(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] 
 <div><b>{h['totale']}</b><span>visti</span></div></div>
 {f'<div class="meta">{h["eliminati"]} eliminati a mano</div>' if h.get("eliminati") else ''}
 <div class="meta">{e(run_line)} · ultimo annuncio nuovo {e(ago(h['ultimo_nuovo']))}</div>{err}</a>{delete}</div>""")
-    out = [f"<h1>Cacce</h1>{flash}"]
+    nuova = ('<a class="btn n" href="/nuova">+ Nuova caccia</a>' if file_names is not None and dir_ok else "")
+    out = [f"<h1>Cacce</h1><p>{nuova}</p>{flash}"]
     titles = {"attiva": None,
               "spenta": "Spente <span class='meta'>(attiva: false nel file YAML: non girano da sole)</span>",
               "eliminata": "Eliminate <span class='meta'>(file YAML rimosso: restano solo i dati nel database)</span>"}
@@ -534,10 +555,15 @@ def state_banner(hunt: str, state: str) -> str:
     elif state == "eliminata":
         txt = "Caccia eliminata: il file YAML non c'e' piu', restano i dati nel database. Non si puo' rieseguire."
     elif state == "non_valida":
-        return "<div class='flash'>Il file YAML di questa caccia non e' valido: controlla il log del servizio.</div>"
+        return (f"<div class='flash bad'>Il file YAML di questa caccia non e' valido. "
+                f"<a href='/caccia/{quote(hunt)}/file'>Apri il file per correggerlo</a>.</div>")
+    elif state == "attiva":
+        return f"<div class='flash'><a href='/caccia/{quote(hunt)}/file'>Modifica il file</a> della caccia.</div>"
     else:
         return ""
     link = f' <a href="/caccia/{quote(hunt)}/elimina">Elimina i dati dal database...</a>' if state in DELETABLE else ""
+    if state in ("attiva", "spenta"):
+        link += f' <a href="/caccia/{quote(hunt)}/file">Modifica il file</a>'
     return f"<div class='flash'>{txt}{link}</div>"
 
 
@@ -652,6 +678,89 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hu
             f"{actions_form}{more}{JS}")
     # mentre c'e' una richiesta in coda o un giro in corso la pagina si aggiorna da sola
     return body, (15 if st["stato"] != "libero" else 0)
+
+
+def render_file_page(cfg: Config, name: str, text: str, base: str, *, is_new: bool = False, msg: str = "",
+                     error: str = "", loaded: str = "") -> str:
+    """Pagina di visualizzazione e modifica del file YAML di una caccia (o di una nuova)."""
+    can_edit = bool(cfg.web_token)
+    summary = ""
+    try:
+        h = huntfiles.parse_text(huntfiles.normalize(text), cfg.hunts_dir,
+                                 None if is_new else huntfiles.find_file(cfg.hunts_dir, name))
+        lo, hi = h.price_limits("ebay")
+        chips = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>' for s in h.fonti)
+        summary = (f"<p class='sub'>{'attiva' if h.attiva else 'spenta'} · ogni {h.ogni_minuti} minuti · {chips} · "
+                   f"eBay: {e(', '.join(h.ebay.marketplaces))}, prezzo {'' if lo is None else lo}..{'' if hi is None else hi} · "
+                   f"lingue delle query: {e(', '.join(h.languages()))}</p>")
+    except huntfiles.HuntFileError as exc:
+        if not error:
+            summary = f"<div class='flash bad'>Il file attuale non e' valido: {e(exc)}</div>"
+    flash = f'<div class="flash">{e(msg)}</div>' if msg else ""
+    if loaded:
+        flash += f'<div class="flash">Caricata la versione del {e(loaded)}: non e\' ancora salvata.</div>'
+    if error:
+        flash += f'<div class="flash bad"><b>Non salvato.</b> {e(error)}</div>'
+    if not can_edit:
+        flash += ('<div class="flash bad">Modifica disabilitata: imposta <code>SCOVATORE_WEB_TOKEN</code> nel .env '
+                  'e riavvia il servizio web. Finche\' non c\'e\' un token si puo\' solo leggere il file.</div>')
+    action = "/nuova" if is_new else f"/caccia/{quote(name)}/file"
+    versions = ""
+    if not is_new:
+        vs = huntfiles.backups(cfg.hunts_dir, name)
+        if vs:
+            versions = ("<details><summary>Versioni precedenti (" + str(len(vs)) + ")</summary><ul class='small'>" +
+                        "".join(f'<li><a href="/caccia/{quote(name)}/file?versione={quote(f)}">{e(d)}</a></li>'
+                                for f, d in vs) + "</ul><p class='meta'>Cliccando una versione la carichi nell'editor "
+                        "senza salvarla.</p></details>")
+    title = "Nuova caccia" if is_new else f"File di {e(name)}"
+    ro = "" if can_edit else " readonly"
+    back = "/" if is_new else f"/caccia/{quote(name)}"
+    return f"""<h1>{title}</h1>{summary}{flash}
+<form method="post" action="{action}"><input type="hidden" name="base" value="{e(base)}">
+<textarea class="code" name="testo" rows="34" spellcheck="false"{ro}>{e(text)}</textarea>
+<p><button{'' if can_edit else ' disabled'}>Salva</button> <a href="{back}">Torna indietro</a>
+<span class="meta"> Prima del salvataggio il file viene controllato; la versione precedente resta in cacce/.storico.</span></p>
+</form>{versions}"""
+
+
+def save_hunt_file(cfg: Config, name: str, form: dict[str, list[str]]) -> tuple[str, str]:
+    """Salva il file di una caccia. Ritorna (messaggio, errore): uno dei due e' vuoto."""
+    if not cfg.web_token:
+        return "", "Modifica disabilitata: manca SCOVATORE_WEB_TOKEN."
+    text = (form.get("testo") or [""])[-1]
+    base = (form.get("base") or [""])[-1]
+    try:
+        h, changed = huntfiles.save(cfg.hunts_dir, name, text, base)
+    except huntfiles.HuntFileError as exc:
+        return "", str(exc)
+    log.info("web: file della caccia %s %s", name, "salvato" if changed else "invariato")
+    return ("File salvato: vale dal prossimo giro." if changed else "Nessuna modifica da salvare."), ""
+
+
+def create_hunt_file(cfg: Config, form: dict[str, list[str]]) -> tuple[str, str, str]:
+    """Crea una nuova caccia. Ritorna (nome, messaggio, errore)."""
+    if not cfg.web_token:
+        return "", "", "Modifica disabilitata: manca SCOVATORE_WEB_TOKEN."
+    try:
+        h = huntfiles.create(cfg.hunts_dir, (form.get("testo") or [""])[-1])
+    except huntfiles.HuntFileError as exc:
+        return "", "", str(exc)
+    log.info("web: creata la caccia %s", h.nome)
+    return h.nome, f"Caccia {h.nome} creata.", ""
+
+
+def toggle_hunt(cfg: Config, name: str, form: dict[str, list[str]]) -> str:
+    """Accende o spegne una caccia cambiando solo `attiva:` nel suo file."""
+    if not cfg.web_token:
+        return "Modifica disabilitata: manca SCOVATORE_WEB_TOKEN."
+    on = (form.get("valore") or [""])[-1] == "1"
+    try:
+        changed = huntfiles.set_active(cfg.hunts_dir, name, on)
+    except huntfiles.HuntFileError as exc:
+        return f"Non modificata: {exc}"
+    log.info("web: caccia %s %s", name, "accesa" if on else "spenta")
+    return f"Caccia {name} {'accesa' if on else 'spenta'}." if changed else f"La caccia {name} era gia' cosi'."
 
 
 def render_runs(conn, defs: dict[str, Hunt] | None = None, file_names: set[str] | None = None,
@@ -814,12 +923,28 @@ def make_handler(cfg: Config):
             if not self._authorized({}) or not self._same_origin():
                 return self._send(403, page("Accesso", '<div class="empty">Azione non consentita.</div>', []))
             parts = [p for p in u.path.split("/") if p]
-            if len(parts) != 3 or parts[0] != "caccia" or parts[2] not in ("azioni", "riesegui", "elimina"):
+            is_new = parts == ["nuova"]
+            if not is_new and (len(parts) != 3 or parts[0] != "caccia" or
+                               parts[2] not in ("azioni", "riesegui", "elimina", "file", "attiva")):
                 return self._send(404, "non trovato", "text/plain")
-            hunt = parts[1]
-            length = min(int(self.headers.get("Content-Length") or 0), 200_000)
+            hunt = "" if is_new else parts[1]
+            length = min(int(self.headers.get("Content-Length") or 0), 500_000)
             form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
             try:
+                if is_new:
+                    nome, msg, err = create_hunt_file(cfg, form)
+                    if err:       # resta nell'editor con il testo scritto
+                        return self._send(400, page("Nuova caccia", render_file_page(
+                            cfg, "", (form.get("testo") or [""])[-1], "", is_new=True, error=err), []))
+                    return self._send(303, "", extra={"Location": f"/caccia/{quote(nome)}/file?" + urlencode({"msg": msg})})
+                if parts[2] == "file":
+                    msg, err = save_hunt_file(cfg, hunt, form)
+                    if err:
+                        return self._send(400, page("Modifica", render_file_page(
+                            cfg, hunt, (form.get("testo") or [""])[-1], (form.get("base") or [""])[-1], error=err), [], hunt))
+                    return self._send(303, "", extra={"Location": f"/caccia/{quote(hunt)}/file?" + urlencode({"msg": msg})})
+                if parts[2] == "attiva":
+                    return self._send(303, "", extra={"Location": "/?" + urlencode({"msg": toggle_hunt(cfg, hunt, form)})})
                 if parts[2] == "riesegui":
                     defs = hunt_defs(cfg)
                     conn = connect(cfg.db_path)
@@ -873,16 +998,34 @@ def make_handler(cfg: Config):
             if u.path == "/salute":
                 return self._send(200, "ok", "text/plain")
             conn = connect(cfg.db_path)
-            if conn is None:
-                return self._send(200, page("Scovatore", f'<div class="empty">Database non trovato in '
-                                                         f'{e(cfg.db_path)}: la prima caccia non ha ancora girato.</div>', []))
+            if conn is None:       # nessun giro ancora fatto: pagine come se il database fosse vuoto
+                conn = DB(Path(":memory:")).conn
             try:
                 defs, fnames, dir_ok = hunt_files(cfg)
                 names = all_hunt_names(conn, defs)
                 parts = [p for p in u.path.split("/") if p]
                 if not parts:
-                    body, names = render_home(conn, defs, fnames, dir_ok, q.get("msg", ""))
+                    body, names = render_home(conn, defs, fnames, dir_ok, q.get("msg", ""), bool(cfg.web_token))
                     return self._send(200, page("Cacce", body, names))
+                if parts == ["nuova"]:
+                    return self._send(200, page("Nuova caccia", render_file_page(
+                        cfg, "", huntfiles.template(cfg.hunts_dir), "", is_new=True, msg=q.get("msg", "")), names))
+                if len(parts) == 3 and parts[0] == "caccia" and parts[2] == "file":
+                    try:
+                        _, current = huntfiles.read(cfg.hunts_dir, parts[1])
+                    except huntfiles.HuntFileError:
+                        return self._send(404, page("Non trovato", '<div class="empty">File della caccia non '
+                                                    'trovato (e\' una caccia eliminata?).</div>', names))
+                    text, loaded = current, ""
+                    if q.get("versione"):
+                        try:
+                            text = huntfiles.read_backup(cfg.hunts_dir, parts[1], q["versione"])
+                            loaded = dict(huntfiles.backups(cfg.hunts_dir, parts[1])).get(q["versione"], q["versione"])
+                        except huntfiles.HuntFileError:
+                            pass
+                    return self._send(200, page("File " + parts[1], render_file_page(
+                        cfg, parts[1], text, huntfiles.digest(current), msg=q.get("msg", ""), loaded=loaded),
+                        names, parts[1]))
                 if len(parts) == 3 and parts[0] == "caccia" and parts[2] == "elimina" and parts[1] in names:
                     st = hunt_state(parts[1], defs, fnames, dir_ok)
                     return self._send(200, page("Elimina i dati", render_delete(

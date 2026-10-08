@@ -5,3 +5,8 @@ __pycache__/
 .pytest_cache/
 *.csv
 !dati/*.csv
+
+# Le cacce sono configurazione personale: restano solo sul server (si modificano dall'interfaccia web).
+# Nel repository pubblico c'e' soltanto il modello.
+cacce/*
+!cacce/esempio-fonti.yaml
