@@ -676,6 +676,7 @@ def test_url_ostili_non_arrivano_ne_alle_richieste_ne_ai_link(servizio):
 
 
 def test_cacce_di_esempio_con_fonti():
+    from pathlib import Path
     from scovatore.hunt import load_all
     root = Path(__file__).resolve().parent.parent
     hunts = {h.nome: h for h in load_all(root / "cacce")}
