@@ -90,7 +90,14 @@ class Config:
     # tutti i siti eBay, e su quello italiano sei gia' loggato e vedi la spedizione in Italia
     link_domain: str = "ebay.it"
 
-    def item_link(self, legacy_id: str) -> str:
+    # Fonti web (Vinted, Subito): pausa fra due richieste allo stesso sito e identita' del client
+    scrape_delay: float = 2.0
+    user_agent: str = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+
+    def item_link(self, legacy_id: str, url: str = "") -> str:
+        """Link all'annuncio. Gli ID delle fonti non eBay ("vinted:123") portano il proprio URL."""
+        if ":" in legacy_id and url:
+            return url
         return f"https://www.{self.link_domain}/itm/{legacy_id}"
 
     @property
@@ -154,6 +161,8 @@ def load_config(env_file: str | None = None) -> Config:
         web_token=_str("SCOVATORE_WEB_TOKEN"),
         plan_llm=_plan_llm(),
         link_domain=_str("SCOVATORE_LINK_DOMAIN", "ebay.it").lower().removeprefix("www.").strip("/") or "ebay.it",
+        scrape_delay=max(0.0, _float("SCOVATORE_SCRAPE_DELAY", 2.0)),
+        user_agent=_str("SCOVATORE_USER_AGENT") or Config.user_agent,
     )
 
 

@@ -13,9 +13,10 @@ from . import prompts
 from .config import Config
 from .db import DB
 from .ebay import EbayClient, EbayError, Listing, build_filter
-from .hunt import MARKETPLACE_LANG, Hunt
+from .hunt import MARKETPLACE_LANG, SOURCE_LABELS, Hunt
 from .llm import LLMClient, LLMError
 from .notify import notify
+from .sources import SourceError, WebSource, build_sources
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,9 @@ class RunStats:
     query: int = 0
     trovati: int = 0
     unici: int = 0
+    richieste: dict[str, int] = field(default_factory=dict)       # richieste HTTP per fonte web
+    trovati_fonte: dict[str, int] = field(default_factory=dict)   # annunci trovati per fonte web
+    fonti: list[str] = field(default_factory=list)                # fonti cercate in questo giro
     scartati_filtri: int = 0
     scartati_paese: int = 0
     ricerche_saltate: int = 0
@@ -112,8 +116,14 @@ def normalize_plan(raw: dict, languages: list[str], per_lang: int) -> dict:
     }
 
 
-def plan_note(hunt: Hunt) -> str:
-    """Descrive al pianificatore i filtri che eBay applica gia', per non sprecare parole nelle query."""
+def plan_note(hunt: Hunt, source: str = "ebay") -> str:
+    """Descrive al pianificatore i filtri che eBay applica gia', per non sprecare parole nelle query.
+
+    Vinted e Subito non filtrano per "guasto/ricambi": li' le parole di stato nelle query servono,
+    quindi la nota e' vuota e il piano le include.
+    """
+    if source != "ebay":
+        return ""
     notes = []
     conds = set(hunt.ebay.condizioni)
     if conds and conds <= {7000}:
@@ -139,15 +149,18 @@ def pick_planner(cfg: Config, palantir: LLMClient | None, groq: LLMClient | None
     return other
 
 
-def plan_key(hunt: Hunt, llm: LLMClient | None) -> str:
-    """Chiave della cache del piano: cambia con la caccia, con chi lo genera e con il prompt."""
+def plan_key(hunt: Hunt, llm: LLMClient | None, source: str = "ebay") -> str:
+    """Chiave della cache del piano: cambia con la caccia, con chi lo genera e con il prompt.
+
+    Include la nota sui filtri della fonte: se due fonti hanno la stessa nota condividono il piano.
+    """
     who = f"{llm.cfg.name}:{llm.cfg.model}" if llm else "nessuno"
-    src = f"{hunt.plan_hash}|{who}|{prompts.PLAN_SYSTEM}|{plan_note(hunt)}"
+    src = f"{hunt.plan_hash}|{who}|{prompts.PLAN_SYSTEM}|{plan_note(hunt, source)}"
     return hashlib.sha256(src.encode()).hexdigest()[:16]
 
 
-def get_plan(hunt: Hunt, db: DB, planner: LLMClient | None, force: bool = False) -> dict:
-    key = plan_key(hunt, planner)
+def get_plan(hunt: Hunt, db: DB, planner: LLMClient | None, force: bool = False, source: str = "ebay") -> dict:
+    key = plan_key(hunt, planner, source)
     if not force:
         cached = db.get_plan(hunt.nome, key)
         if cached:
@@ -156,7 +169,7 @@ def get_plan(hunt: Hunt, db: DB, planner: LLMClient | None, force: bool = False)
             return cached
     if planner is None:
         raise LLMError("serve Palantir o Groq per generare il piano (o usa solo query_extra)")
-    note = plan_note(hunt)
+    note = plan_note(hunt, source)
     log.info("[%s] genero il piano con %s (%s) per le lingue %s%s", hunt.nome, planner.cfg.name,
              planner.cfg.model, ",".join(hunt.languages()), " (rigenerazione forzata)" if force else "")
     langs = hunt.languages()
@@ -189,6 +202,19 @@ def queries_for(marketplace_lang: str, plan: dict, hunt: Hunt) -> list[str]:
     di ogni lingua invece di una lingua intera.
     """
     langs = [marketplace_lang, "en"] + [l for l in hunt.languages() if l not in (marketplace_lang, "en")]
+    return _interleave(langs, plan, hunt)
+
+
+def source_queries(lang: str, plan: dict, hunt: Hunt) -> list[str]:
+    """Query per una fonte web (Vinted, Subito): solo la lingua del sito, piu' le query manuali.
+
+    Sono siti nazionali con annunci nella lingua locale: lanciare le altre lingue moltiplicherebbe
+    le richieste a un sito che non ha un'API, per risultati quasi sempre vuoti.
+    """
+    return _interleave([lang], plan, hunt)
+
+
+def _interleave(langs: list[str], plan: dict, hunt: Hunt) -> list[str]:
     per_lang = [plan["query"].get(l, []) for l in langs]
     depth = max((len(q) for q in per_lang), default=0)
     ordered = [qs[i] for i in range(depth) for qs in per_lang if i < len(qs)]
@@ -202,7 +228,33 @@ def queries_for(marketplace_lang: str, plan: dict, hunt: Hunt) -> list[str]:
 # ---------------------------------------------------------------------------
 # 2-3. Ricerca e filtri locali
 # ---------------------------------------------------------------------------
+def _excluded_word(title: str, excluded: list[str]) -> str | None:
+    title = title.lower()
+    for w in excluded:
+        if w and re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", title):
+            return w
+    return None
+
+
+def web_reject_reason(l: Listing, hunt: Hunt, excluded: list[str]) -> str | None:
+    """Filtri locali per gli annunci di Vinted e Subito: valuta, budget, parole escluse."""
+    params = getattr(hunt, l.source)
+    lo, hi = hunt.price_limits(l.source)
+    if l.currency and l.currency != params.valuta:
+        return f"valuta {l.currency}"
+    if hi is not None and l.total > hi:
+        return f"totale {l.total:.2f} oltre budget"
+    if lo is not None and l.price < lo:
+        return f"prezzo {l.price:.2f} sotto il minimo"
+    w = _excluded_word(l.title, excluded)
+    if w:
+        return f"parola esclusa '{w}'"
+    return None
+
+
 def local_reject_reason(l: Listing, hunt: Hunt, excluded: list[str]) -> str | None:
+    if l.source != "ebay":
+        return web_reject_reason(l, hunt, excluded)
     p = hunt.ebay
     allowed = p.allowed_countries()
     if allowed is not None and l.country and l.country.upper() not in allowed:
@@ -216,14 +268,15 @@ def local_reject_reason(l: Listing, hunt: Hunt, excluded: list[str]) -> str | No
         if p.spedizione_ignota == "scarta_estero" and dest and l.country and l.country.upper() != dest:
             # dall'estero, senza costo di spedizione per il nostro paese: quasi sempre non spedisce qui
             return f"non spedisce in {dest} (da {l.country}, spedizione ignota)"
+    if p.spedizione_max is not None and l.shipping is not None and l.shipping > p.spedizione_max:
+        return f"spedizione {l.shipping:.2f} oltre il massimo {p.spedizione_max:g}"
     if p.prezzo_max is not None:
         cost = l.total if p.spedizione_inclusa else l.price
         if cost > p.prezzo_max:
             return f"totale {cost:.2f} oltre budget"
-    title = l.title.lower()
-    for w in excluded:
-        if w and re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", title):
-            return f"parola esclusa '{w}'"
+    w = _excluded_word(l.title, excluded)
+    if w:
+        return f"parola esclusa '{w}'"
     if p.feedback_minimo is not None and l.seller_feedback_pct is not None \
             and l.seller_feedback_pct < p.feedback_minimo:
         return f"feedback {l.seller_feedback_pct}%"
@@ -284,6 +337,58 @@ def search_all(hunt: Hunt, plan: dict, ebay: EbayClient, stats: RunStats) -> lis
     return list(best.values())
 
 
+def source_tasks(hunt: Hunt, plan: dict, src: WebSource) -> list[tuple[str, str]]:
+    """Coppie (scope, query) di una fonte web, a strati come per eBay: prima la query n.1 di ogni
+    scope, poi la n.2..., cosi' il tetto di ricerche taglia le varianti meno importanti."""
+    per_scope = {sc: source_queries(src.scope_lang(sc), plan, hunt) for sc in src.scopes(hunt)}
+    depth = max((len(q) for q in per_scope.values()), default=0)
+    return [(sc, qs[i]) for i in range(depth) for sc, qs in per_scope.items() if i < len(qs)]
+
+
+def search_sources(hunt: Hunt, plans: dict[str, dict], sources: dict[str, WebSource],
+                   stats: RunStats) -> list[Listing]:
+    """Ricerca sulle fonti web. Un blocco o 3 errori di fila fermano quella fonte, non le altre."""
+    best: dict[str, Listing] = {}
+    for name, src in sources.items():
+        tasks = source_tasks(hunt, plans[name], src)
+        cap = src.max_searches(hunt)
+        if len(tasks) > cap:
+            stats.ricerche_saltate += len(tasks) - cap
+            log.warning("[%s] %s: %d ricerche previste, eseguo le prime %d; saltate %d", hunt.nome, src.label,
+                        len(tasks), cap, len(tasks) - cap)
+            tasks = tasks[:cap]
+        log.info("[%s] %s: %d ricerche (%s)", hunt.nome, src.label, len(tasks), src.describe(hunt))
+        fails = found_total = 0
+        for n, (scope, q) in enumerate(tasks, 1):
+            stats.query += 1
+            t0 = time.monotonic()
+            try:
+                found = src.search(q, scope, hunt)
+            except SourceError as exc:
+                stats.errori.append(f"{src.label} {scope} '{q}': {exc}")
+                log.error("[%s] %s ricerca %d/%d fallita %s '%s': %s", hunt.nome, src.label, n, len(tasks),
+                          scope, q, exc)
+                fails += 1
+                if exc.blocked or fails >= 3:
+                    log.warning("[%s] %s: ricerche interrotte per questo giro (%s)", hunt.nome, src.label,
+                                "bloccato dal sito" if exc.blocked else "3 errori di fila")
+                    break
+                continue
+            fails = 0
+            new = sum(1 for l in found if l.legacy_id not in best)
+            log.info("[%s] %s ricerca %d/%d %s '%s': %d risultati, %d mai visti in questo giro (%.1f s)",
+                     hunt.nome, src.label, n, len(tasks), scope, q, len(found), new, time.monotonic() - t0)
+            stats.trovati += len(found)
+            found_total += len(found)
+            for l in found:
+                cur = best.get(l.legacy_id)
+                if cur is None or l.total < cur.total:
+                    best[l.legacy_id] = l
+        stats.richieste[name] = src.calls
+        stats.trovati_fonte[name] = found_total
+    return list(best.values())
+
+
 # ---------------------------------------------------------------------------
 # 4. Scrematura (Palantir, titoli in blocco)
 # ---------------------------------------------------------------------------
@@ -332,7 +437,9 @@ def screen(hunt: Hunt, plan: dict, items: list[Listing], palantir: LLMClient, db
 # 5. Verifica avanzata (Groq, un annuncio alla volta)
 # ---------------------------------------------------------------------------
 def listing_payload(l: Listing) -> dict:
+    extra = {"fonte": SOURCE_LABELS.get(l.source, l.source)} if l.source != "ebay" else {}
     return {
+        **extra,
         "titolo": l.title,
         "prezzo": l.price, "spedizione": l.shipping, "totale": l.total, "valuta": l.currency,
         "asta": l.is_auction,
@@ -352,8 +459,8 @@ def needs_verify(row, hunt: Hunt, total: float) -> bool:
     return abs(total - row["verify_total"]) > max(1.0, 0.05 * row["verify_total"])
 
 
-def verify(hunt: Hunt, items: list[Listing], ebay: EbayClient, groq: LLMClient, db: DB,
-           cfg: Config, stats: RunStats) -> None:
+def verify(hunt: Hunt, items: list[Listing], ebay: EbayClient | None, groq: LLMClient, db: DB,
+           cfg: Config, stats: RunStats, sources: dict[str, WebSource] | None = None) -> None:
     ref = hunt.reference_text()
     log.info("[%s] verifica Groq di %d annunci", hunt.nome, len(items))
     for n, l in enumerate(items, 1):
@@ -364,8 +471,12 @@ def verify(hunt: Hunt, items: list[Listing], ebay: EbayClient, groq: LLMClient, 
         # che rivedremo al prossimo giro (il dettaglio puo' riportare una spedizione diversa)
         summary_total = l.total
         try:
-            ebay.get_item(l, cfg.description_max_chars)
-        except EbayError as exc:
+            if l.source == "ebay":
+                ebay.get_item(l, cfg.description_max_chars)
+            elif sources and l.source in sources:
+                sources[l.source].enrich(l, cfg.description_max_chars)
+        except (EbayError, SourceError) as exc:
+            # il dettaglio e' un di piu': senza, Groq lavora sul riepilogo della ricerca
             log.warning("[%s] dettaglio non disponibile per %s: %s", hunt.nome, l.legacy_id, exc)
         dest = (hunt.ebay.consegna_paese or "").upper()
         if l.ships_to_buyer is False and dest:
@@ -412,35 +523,70 @@ def _reason_key(reason: str) -> str:
         return "feedback basso"
     if reason.startswith("valuta"):
         return "altra valuta"
+    if reason.startswith("spedizione") and "oltre" in reason:
+        return "spedizione alta"
+    if reason.startswith("prezzo"):
+        return "sotto il minimo"
     if reason.startswith("non spedisce"):
         return "non spedisce qui"
     return reason
 
 
-def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMClient | None,
-             groq: LLMClient | None, force_plan: bool = False) -> RunStats:
+def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient | None, palantir: LLMClient | None,
+             groq: LLMClient | None, force_plan: bool = False,
+             sources: dict[str, WebSource] | None = None, only: list[str] | None = None) -> RunStats:
+    """Un giro della caccia sulle sue fonti (`fonti`). `only` ne limita il giro a una parte
+    (riesecuzione dall'interfaccia); `sources` permette di passare client gia' pronti (test)."""
     stats = RunStats()
-    run_id = db.start_run(hunt.nome)
-    calls_before = ebay.calls
+    active = [s for s in hunt.fonti if only is None or s in only]
+    if not active:
+        raise ValueError(f"{hunt.nome}: nessuna delle fonti richieste {only} e' attiva nella caccia {hunt.fonti}")
+    stats.fonti = active
+    parziale = set(active) != set(hunt.fonti)
+    run_id = db.start_run(hunt.nome, parziale)
+    calls_before = ebay.calls if ebay else 0
     t_start = time.monotonic()
     error = None
-    allowed = hunt.ebay.allowed_countries()
-    log.info("[%s] === giro %d avviato: %d marketplace, paesi ammessi %s, budget eBay residuo %d chiamate ===",
-             hunt.nome, run_id, len(hunt.ebay.marketplaces),
-             "tutti" if allowed is None else ("UE27" if len(allowed) == 27 else ",".join(sorted(allowed))),
-             ebay.call_budget - ebay.calls)
+    own_sources = sources is None
+    web: dict[str, WebSource] = {}
+    log.info("[%s] === giro %d avviato: fonti %s%s ===", hunt.nome, run_id, ",".join(active),
+             " (parziale)" if parziale else "")
+    if "ebay" in active and ebay is not None:
+        allowed = hunt.ebay.allowed_countries()
+        log.info("[%s] eBay: %d marketplace, paesi ammessi %s, budget residuo %d chiamate", hunt.nome,
+                 len(hunt.ebay.marketplaces),
+                 "tutti" if allowed is None else ("UE27" if len(allowed) == 27 else ",".join(sorted(allowed))),
+                 ebay.call_budget - ebay.calls)
     try:
+        web = (build_sources(hunt, cfg, [s for s in active if s != "ebay"]) if own_sources
+               else {n: s for n, s in sources.items() if n in active})
+        planner = pick_planner(cfg, palantir, groq)
+        plans: dict[str, dict] = {}
         with phase(stats, "piano", hunt.nome):
-            plan = get_plan(hunt, db, pick_planner(cfg, palantir, groq), force=force_plan)
-        excluded = [w.lower() for w in hunt.parole_escluse] + plan["parole_escluse"]
+            done: set[str] = set()
+            for s in active:
+                key = plan_key(hunt, planner, s)
+                # fonti con la stessa nota condividono il piano: si rigenera una volta sola
+                plans[s] = get_plan(hunt, db, planner, force=force_plan and key not in done, source=s)
+                done.add(key)
+        excluded_by = {s: [w.lower() for w in hunt.parole_escluse] + plans[s]["parole_escluse"] for s in active}
 
         with phase(stats, "ricerca", hunt.nome):
-            listings = search_all(hunt, plan, ebay, stats)
+            listings: list[Listing] = []
+            if "ebay" in active:
+                if ebay is None:
+                    stats.errori.append("eBay: client non configurato (EBAY_APP_ID / EBAY_CERT_ID)")
+                    log.error("[%s] eBay e' tra le fonti ma non e' configurato: salto la fonte", hunt.nome)
+                else:
+                    listings += search_all(hunt, plans["ebay"], ebay, stats)
+            if web:
+                listings += search_sources(hunt, plans, web, stats)
+            stats.unici = len(listings)
 
         kept: list[Listing] = []
         reasons: Counter = Counter()
         for l in listings:
-            reason = local_reject_reason(l, hunt, excluded)
+            reason = local_reject_reason(l, hunt, excluded_by[l.source])
             if reason:
                 stats.scartati_filtri += 1
                 if reason.startswith("paese"):
@@ -464,7 +610,10 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
         if to_screen:
             with phase(stats, "scrematura", hunt.nome):
                 if hunt.screening and palantir is not None:
-                    screen(hunt, plan, to_screen, palantir, db, cfg.screen_batch_size, stats)
+                    for s in active:   # ogni fonte con il proprio piano (requisiti_base)
+                        group = [l for l in to_screen if l.source == s]
+                        if group:
+                            screen(hunt, plans[s], group, palantir, db, cfg.screen_batch_size, stats)
                 else:
                     log.info("[%s] scrematura disattivata: %d annunci passano come 'saltato'",
                              hunt.nome, len(to_screen))
@@ -496,7 +645,7 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
 
         if groq is not None and todo:
             with phase(stats, "verifica", hunt.nome):
-                verify(hunt, todo, ebay, groq, db, cfg, stats)
+                verify(hunt, todo, ebay, groq, db, cfg, stats, web)
         elif todo:
             log.warning("[%s] GROQ_API_KEY assente: verifica avanzata saltata per %d annunci", hunt.nome, len(todo))
 
@@ -509,7 +658,10 @@ def run_hunt(hunt: Hunt, cfg: Config, db: DB, ebay: EbayClient, palantir: LLMCli
         log.error("[%s] giro %d interrotto: %s", hunt.nome, run_id, error)
         raise
     finally:
-        stats.chiamate_ebay = ebay.calls - calls_before
+        if own_sources:
+            for s in web.values():
+                s.close()
+        stats.chiamate_ebay = (ebay.calls - calls_before) if ebay else 0
         if palantir:
             stats.token_palantir = palantir.tokens_in + palantir.tokens_out
         if groq:

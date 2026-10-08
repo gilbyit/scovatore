@@ -48,6 +48,7 @@ class Listing:
     aspects: dict[str, str] = field(default_factory=dict)
     condition_description: str = ""
     ships_to_buyer: bool | None = None   # dal dettaglio: None = non si sa
+    source: str = "ebay"                 # ebay | vinted | subito (gli ID non eBay hanno il prefisso "fonte:")
 
     @property
     def total(self) -> float:

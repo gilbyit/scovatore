@@ -13,11 +13,13 @@ from pathlib import Path
 from .config import Config, load_config
 from .db import DB
 from .ebay import EbayClient, EbayError, build_filter
-from .hunt import Hunt, HuntError, load_all, load_hunt
+from .hunt import SOURCE_LABELS, SOURCES, Hunt, HuntError, load_all, load_hunt
 from .llm import LLMClient, LLMError
-from .pipeline import get_plan, pick_planner, run_hunt
+from .pipeline import get_plan, pick_planner, plan_key, run_hunt
 
 log = logging.getLogger("scovatore")
+
+REQUEST_POLL_SECONDS = 10   # ogni quanto il loop guarda le richieste di riesecuzione dell'interfaccia web
 
 
 def _clients(cfg: Config, need_ebay: bool = True, db: DB | None = None):
@@ -49,12 +51,26 @@ def cmd_piano(cfg: Config, args) -> int:
     hunt = _resolve(cfg, args.caccia)
     db = DB(cfg.db_path)
     _, palantir, groq = _clients(cfg, need_ebay=False)
-    plan = get_plan(hunt, db, pick_planner(cfg, palantir, groq), force=args.rigenera)
-    print(f"Caccia: {hunt.nome}")
-    print(f"Piano generato da: {plan.get('generato_da', '?')} (SCOVATORE_PLAN_LLM={cfg.plan_llm})")
-    print(f"Filtro eBay: {build_filter(hunt.ebay)}")
-    print(f"Marketplace: {', '.join(hunt.ebay.marketplaces)}")
-    print(json.dumps(plan, ensure_ascii=False, indent=2))
+    planner = pick_planner(cfg, palantir, groq)
+    print(f"Caccia: {hunt.nome} (fonti: {', '.join(hunt.fonti)})")
+    done: set[str] = set()
+    for s in hunt.fonti:
+        key = plan_key(hunt, planner, s)
+        if key in done:        # stessa nota sui filtri: stesso piano, gia' mostrato
+            print(f"\nPiano {SOURCE_LABELS[s]}: identico a quello gia' mostrato")
+            continue
+        plan = get_plan(hunt, db, planner, force=args.rigenera and key not in done, source=s)
+        done.add(key)
+        print(f"\nPiano per {SOURCE_LABELS[s]}, generato da: {plan.get('generato_da', '?')} "
+              f"(SCOVATORE_PLAN_LLM={cfg.plan_llm})")
+        if s == "ebay":
+            print(f"Filtro eBay: {build_filter(hunt.ebay)}")
+            print(f"Marketplace: {', '.join(hunt.ebay.marketplaces)}")
+        elif s == "vinted":
+            print(f"Domini Vinted: {', '.join(hunt.vinted.domini)} (query solo nella lingua del dominio)")
+        else:
+            print(f"Subito: regione {hunt.subito.regione}, categoria {hunt.subito.categoria} (query in italiano)")
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
     if hunt.query_extra:
         print(f"Query extra: {hunt.query_extra}")
     return 0
@@ -67,6 +83,9 @@ def _print_stats(name: str, s) -> None:
     print(f"scremati {s.scremati} (no: {s.scremati_no}) | verificati {s.verificati} | conformi {s.conformi} "
           f"| notificati {s.notificati}")
     print(f"chiamate eBay {s.chiamate_ebay} | token Palantir {s.token_palantir} | token Groq {s.token_groq}")
+    if s.richieste:
+        print("richieste fonti web: " + ", ".join(
+            f"{SOURCE_LABELS.get(k, k)} {n} (trovati {s.trovati_fonte.get(k, 0)})" for k, n in s.richieste.items()))
     if s.non_spediscono:
         print(f"scartati in verifica perche' non spediscono qui {s.non_spediscono}")
     if s.scartati_paese or s.ricerche_saltate:
@@ -77,15 +96,32 @@ def _print_stats(name: str, s) -> None:
         print(f"  ! {e}")
 
 
-def _run(cfg: Config, hunt: Hunt, force_plan: bool = False):
+def _parse_sources(raw: str | None, hunt: Hunt) -> list[str] | None:
+    """--fonte ebay,vinted -> ["ebay", "vinted"]; None o "tutte" = tutte le fonti della caccia."""
+    if not raw or raw.strip().lower() in ("tutte", "tutti", "*"):
+        return None
+    out = [s.strip().lower() for s in raw.split(",") if s.strip()]
+    bad = [s for s in out if s not in SOURCES]
+    if bad:
+        raise HuntError(f"fonte sconosciuta: {bad} (valide: {', '.join(SOURCES)})")
+    off = [s for s in out if s not in hunt.fonti]
+    if off:
+        raise HuntError(f"la caccia {hunt.nome} non ha attiva la fonte {off} (fonti: {', '.join(hunt.fonti)}): "
+                        f"aggiungila al campo `fonti` del file YAML")
+    return out
+
+
+def _run(cfg: Config, hunt: Hunt, force_plan: bool = False, only: list[str] | None = None):
     db = DB(cfg.db_path)
+    active = [s for s in hunt.fonti if only is None or s in only]
     try:
-        ebay, palantir, groq = _clients(cfg, db=db)
+        # il client eBay serve (e il suo budget conta) solo se eBay e' tra le fonti di questo giro
+        ebay, palantir, groq = _clients(cfg, need_ebay="ebay" in active, db=db)
     except EbayError:
         db.close()
         raise
     try:
-        stats = run_hunt(hunt, cfg, db, ebay, palantir, groq, force_plan=force_plan)
+        stats = run_hunt(hunt, cfg, db, ebay, palantir, groq, force_plan=force_plan, only=only)
     finally:
         for c in (ebay, palantir, groq):
             if c:
@@ -97,9 +133,50 @@ def _run(cfg: Config, hunt: Hunt, force_plan: bool = False):
 
 def cmd_esegui(cfg: Config, args) -> int:
     hunt = _resolve(cfg, args.caccia)
-    _run(cfg, hunt, force_plan=args.rigenera_piano)
+    _run(cfg, hunt, force_plan=args.rigenera_piano, only=_parse_sources(args.fonte, hunt))
     _show(cfg, hunt.nome, min_score=0, limit=args.mostra, tutti=False)
     return 0
+
+
+def process_requests(cfg: Config) -> int:
+    """Esegue le riesecuzioni chieste dall'interfaccia web (pulsante "Riesegui ora").
+
+    Il web e il loop sono container diversi: il web scrive la richiesta nel DB, il loop la
+    prende qui. Ignora ogni_minuti e anche `attiva: false`, perche' l'operatore l'ha chiesta.
+    """
+    db = DB(cfg.db_path)
+    try:
+        pending = db.pending_requests()
+    finally:
+        db.close()
+    done = 0
+    for req in pending:
+        db = DB(cfg.db_path)
+        try:
+            if not db.claim_request(req["id"]):
+                continue            # un altro processo l'ha gia' presa
+        finally:
+            db.close()
+        error = None
+        try:
+            hunt = next((h for h in load_all(cfg.hunts_dir) if h.nome == req["hunt"]), None)
+            if hunt is None:
+                raise HuntError(f"caccia {req['hunt']!r} non trovata in {cfg.hunts_dir}")
+            only = _parse_sources(req["fonti"], hunt)
+            log.info("riesecuzione richiesta dall'interfaccia: %s (fonti %s%s)", hunt.nome,
+                     ",".join(only) if only else "tutte", ", piano rigenerato" if req["rigenera_piano"] else "")
+            _run(cfg, hunt, force_plan=bool(req["rigenera_piano"]), only=only)
+            done += 1
+        except Exception as exc:    # l'errore resta visibile nell'interfaccia
+            error = f"{type(exc).__name__}: {exc}"
+            log.error("riesecuzione di %s fallita: %s", req["hunt"], error)
+        finally:
+            db = DB(cfg.db_path)
+            try:
+                db.finish_request(req["id"], error)
+            finally:
+                db.close()
+    return done
 
 
 def _due(cfg: Config, hunt: Hunt) -> bool:
@@ -145,8 +222,24 @@ def cmd_tutte(cfg: Config, args) -> int:
     return rc
 
 
+def _wait_for_requests(cfg: Config, seconds: float) -> None:
+    """Attende `seconds` secondi, ma ogni pochi secondi guarda se l'interfaccia web ha chiesto
+    una riesecuzione e, in caso, la esegue subito."""
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            process_requests(cfg)
+        except Exception as exc:  # il loop non deve morire per un errore imprevisto
+            log.exception("errore nell'elaborare le richieste di riesecuzione: %s", exc)
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(REQUEST_POLL_SECONDS, left))
+
+
 def cmd_loop(cfg: Config, args) -> int:
-    log.info("loop avviato, controllo ogni %d minuti", args.intervallo)
+    log.info("loop avviato, controllo ogni %d minuti (richieste dall'interfaccia web ogni %d s)",
+             args.intervallo, REQUEST_POLL_SECONDS)
     while True:
         try:
             args.forza = False
@@ -157,7 +250,7 @@ def cmd_loop(cfg: Config, args) -> int:
             log.exception("errore nel giro di controllo: %s", exc)
         nxt = datetime.now() + timedelta(minutes=args.intervallo)
         log.info("in attesa, prossimo controllo alle %s", nxt.strftime("%H:%M"))
-        time.sleep(args.intervallo * 60)
+        _wait_for_requests(cfg, args.intervallo * 60)
 
 
 def _show(cfg: Config, name: str, min_score: int, limit: int, tutti: bool, csv_path: str | None = None):
@@ -176,14 +269,15 @@ def _show(cfg: Config, name: str, min_score: int, limit: int, tutti: bool, csv_p
             v = json.loads(r["verify_json"])
             if v.get("sintesi"):
                 print(f"{'':>29}{v['sintesi'][:150]}")
-        print(f"{'':>29}{cfg.item_link(r['legacy_id'])}")
+        print(f"{'':>29}{cfg.item_link(r['legacy_id'], r['url'] or '')}")
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["punteggio", "esito", "totale", "valuta", "titolo", "url", "sintesi", "rischi"])
             for r in rows:
                 v = json.loads(r["verify_json"] or "{}")
-                w.writerow([r["score"], r["verdict"], r["total"], r["currency"], r["title"], cfg.item_link(r["legacy_id"]),
+                w.writerow([r["score"], r["verdict"], r["total"], r["currency"], r["title"],
+                            cfg.item_link(r["legacy_id"], r["url"] or ""),
                             v.get("sintesi", ""), "; ".join(v.get("segnali_rischio") or [])])
         print(f"\nCSV scritto in {csv_path}")
 
@@ -196,23 +290,38 @@ def cmd_risultati(cfg: Config, args) -> int:
 
 def cmd_controlla(cfg: Config, args) -> int:
     ok = True
+    try:
+        hunts = load_all(cfg.hunts_dir)
+    except HuntError as exc:
+        print(f"ERRORE {exc}")
+        hunts, ok = [], False
+    uses_ebay = any(h.uses("ebay") for h in hunts) or not hunts   # senza cacce: si controlla comunque
     for name, val in (("EBAY_APP_ID", cfg.ebay_app_id), ("EBAY_CERT_ID", cfg.ebay_cert_id),
                       ("PALANTIR_BASE_URL", cfg.palantir.base_url), ("GROQ_API_KEY", cfg.groq.api_key)):
         print(f"{'ok ' if val else 'MANCA'} {name}")
-        ok &= bool(val) or name == "GROQ_API_KEY"
+        optional = name == "GROQ_API_KEY" or (name.startswith("EBAY_") and not uses_ebay)
+        ok &= bool(val) or optional
     print(f"ok  piano generato da: {cfg.plan_llm}")
     if cfg.plan_llm == "groq" and not cfg.groq.api_key:
         print("ATTENZIONE SCOVATORE_PLAN_LLM=groq ma GROQ_API_KEY manca: il piano lo fara' Palantir")
     try:
-        hunts = load_all(cfg.hunts_dir)
         for h in hunts:
             h.reference_text()
             print(f"ok  caccia {h.nome} ({'attiva' if h.attiva else 'disattiva'}, ogni {h.ogni_minuti} min) "
-                  f"filtro: {build_filter(h.ebay)}")
-            allowed = h.ebay.allowed_countries()
-            print(f"      marketplace: {','.join(m.removeprefix('EBAY_') for m in h.ebay.marketplaces)} | "
-                  f"paesi ammessi: {'tutti' if allowed is None else 'UE27' if len(allowed) == 27 else ','.join(sorted(allowed))}"
-                  f" | max_ricerche {h.ebay.max_ricerche} | lingue {','.join(h.languages())}")
+                  f"fonti: {', '.join(h.fonti)}")
+            if h.uses("ebay"):
+                allowed = h.ebay.allowed_countries()
+                print(f"      eBay filtro: {build_filter(h.ebay)}")
+                print(f"      marketplace: {','.join(m.removeprefix('EBAY_') for m in h.ebay.marketplaces)} | "
+                      f"paesi ammessi: {'tutti' if allowed is None else 'UE27' if len(allowed) == 27 else ','.join(sorted(allowed))}"
+                      f" | max_ricerche {h.ebay.max_ricerche}")
+            if h.uses("vinted"):
+                print(f"      Vinted: domini {','.join(h.vinted.domini)} | prezzo {h.price_limits('vinted')} "
+                      f"| max_ricerche {h.vinted.max_ricerche}")
+            if h.uses("subito"):
+                print(f"      Subito: regione {h.subito.regione}, categoria {h.subito.categoria} | prezzo "
+                      f"{h.price_limits('subito')} | max_ricerche {h.subito.max_ricerche}")
+            print(f"      lingue del piano: {','.join(h.languages())}")
     except HuntError as exc:
         print(f"ERRORE {exc}")
         ok = False
@@ -239,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("esegui", help="esegue una caccia")
     p.add_argument("caccia")
     p.add_argument("--rigenera-piano", action="store_true")
+    p.add_argument("--fonte", help="solo queste fonti della caccia, per esempio ebay,vinted (default: tutte)")
     p.add_argument("--mostra", type=int, default=15, help="quanti risultati stampare alla fine")
     p.set_defaults(fn=cmd_esegui)
 

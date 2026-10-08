@@ -160,9 +160,11 @@ def test_hunt_validation():
 
 def test_example_hunts_are_valid():
     hunts = load_all(ROOT / "cacce")
-    assert {h.nome for h in hunts} == {"mobo-ddr3-quad", "ampli-guasto"}
+    files = sorted((ROOT / "cacce").glob("*.y*ml"))
+    assert len(hunts) == len(files), "una caccia di esempio non si carica"   # load_all salta le invalide
+    assert {"mobo-ddr3-quad", "ampli-guasto"} <= {h.nome for h in hunts}
     amp = next(h for h in hunts if h.nome == "ampli-guasto")
-    assert amp.ebay.condizioni == [7000]
+    assert amp.ebay.condizioni == [7000] and amp.ebay.spedizione_max == 15
 
 
 def test_extract_json_variants():

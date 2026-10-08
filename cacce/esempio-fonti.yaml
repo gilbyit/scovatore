@@ -1,0 +1,48 @@
+# Esempio: una caccia che cerca su piu' fonti (eBay, Vinted, Subito.it).
+# E' DISATTIVATA (attiva: false): non gira da sola. Per provarla senza attivarla apri la sua pagina
+# nell'interfaccia web e premi "Riesegui ora", oppure: python -m scovatore esegui esempio-fonti
+# Per usarla davvero copia il file, cambia nome e ricerca e metti attiva: true.
+
+nome: esempio-fonti
+attiva: false
+ogni_minuti: 240
+
+# Quali ricerche attivare. Se il campo manca, la caccia cerca solo su eBay (come prima).
+# Ogni fonte ha la sua sezione di parametri qui sotto; una fonte non elencata qui non gira.
+fonti: [ebay, vinted, subito]
+
+ebay:
+  marketplaces: [EBAY_IT]
+  prezzo_max: 150               # il budget vale anche per Vinted e Subito, se non ne indichi uno loro
+  spedizione_inclusa: true
+  spedizione_max: 15
+  regione: EUROPEAN_UNION
+  consegna_paese: IT
+  condizioni: [guasto]
+
+# Vinted: non ha un'API pubblica, si usa lo stesso endpoint del sito (vedi README, "Vinted e Subito").
+vinted:
+  domini: [it]                  # it, fr, de, es, nl, pl, be, at, lu, pt, lt, cz
+  # prezzo_min / prezzo_max: se omessi valgono quelli della sezione ebay
+  spedizione_stimata: 5         # sommata al prezzo per il budget (la spedizione dipende dal corriere)
+  # condizioni: [nuovo, ottimo, buono, discreto]   # stato dichiarato dal venditore
+  max_risultati_per_query: 48
+  max_ricerche: 10              # tetto di richieste per giro: pochi, e' un sito senza API
+
+# Subito.it: non ha un'API pubblica, si legge il JSON incorporato nelle pagine dei risultati.
+subito:
+  regione: piemonte             # italia, piemonte, lombardia, ...: molti annunci sono solo a ritiro
+  categoria: usato              # usato, informatica, audio-video, ...
+  # il filtro di prezzo e' sempre locale (usa prezzo_min / prezzo_max qui o in ebay)
+  max_ricerche: 6
+
+ricerca: >
+  Amplificatore audio hi-fi vintage (integrato, finale o ricevitore stereo), preferibilmente
+  degli anni 70 o 80, guasto o non funzionante, venduto per ricambi o da riparare.
+
+parole_escluse: [solo telecomando, service manual, schema elettrico]
+
+requisiti_avanzati: |
+  - Marca e modello di buona reputazione e qualita' costruttiva (hi-fi di fascia media o alta).
+  - I sintomi dichiarati devono far pensare a un guasto di alimentazione e non allo stadio finale.
+  - Su Vinted e Subito il guasto non e' filtrato dal sito: scarta gli oggetti che risultano funzionanti.
