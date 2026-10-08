@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from http import cookies
@@ -17,9 +18,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from .config import Config
-from .db import DB, MANUAL_VERDICTS
+from .db import DB, MANUAL_VERDICTS, STALE_RUN_HOURS
+from .hunt import SOURCE_LABELS, SOURCES, Hunt, load_hunt
 
 log = logging.getLogger(__name__)
+
+POLL_HINT = 10                      # secondi: ogni quanto il loop guarda le richieste (cli.REQUEST_POLL_SECONDS)
+ITEM_ID = re.compile(r"(?:[a-z]+:)?\d+")   # ID legacy eBay (solo cifre) o "vinted:123", "subito:456"
 
 ESITI = {
     "verificati": "Verificati",
@@ -45,6 +50,7 @@ AZIONI = {
 }
 EFF = "COALESCE(manual_verdict, verdict)"   # esito effettivo: l'operatore prevale sul modello
 ORDINI = {"punteggio": "Punteggio", "prezzo": "Prezzo", "recenti": "Più recenti"}
+FONTI = {"": "Tutte"} | SOURCE_LABELS
 LIMIT = 300
 
 
@@ -96,10 +102,45 @@ def countries(conn: sqlite3.Connection, hunt: str) -> list[str]:
         "SELECT DISTINCT country FROM items WHERE hunt=? AND country != '' ORDER BY country", (hunt,))]
 
 
+def hunt_defs(cfg: Config) -> dict[str, Hunt]:
+    """Le cacce definite nei file YAML (se la cartella e' montata), per nome. Le non valide si saltano."""
+    out: dict[str, Hunt] = {}
+    try:
+        files = sorted(cfg.hunts_dir.glob("*.y*ml"))
+    except OSError:
+        return out
+    for p in files:
+        try:
+            h = load_hunt(p)
+            out[h.nome] = h
+        except Exception as exc:
+            log.debug("web: caccia %s non letta: %s", p.name, exc)
+    return out
+
+
+def run_status(conn: sqlite3.Connection, hunt: str) -> dict:
+    """Stato della riesecuzione: in coda, in corso, oppure libera (con l'esito dell'ultima richiesta)."""
+    req = conn.execute("SELECT * FROM run_requests WHERE hunt=? ORDER BY id DESC LIMIT 1", (hunt,)).fetchone()
+    running = conn.execute(
+        """SELECT started_at FROM runs WHERE hunt=? AND finished_at IS NULL
+           AND started_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', ?) ORDER BY id DESC LIMIT 1""",
+        (hunt, f"-{STALE_RUN_HOURS} hours")).fetchone()
+    if req and req["claimed_at"] is None:
+        return {"stato": "coda", "dal": req["requested_at"]}
+    if running:
+        return {"stato": "corso", "dal": running["started_at"]}
+    err = req["error"] if req and req["finished_at"] else None
+    return {"stato": "libero", "errore": err, "dal": req["requested_at"] if req else None}
+
+
 def query_items(conn: sqlite3.Connection, hunt: str, esito: str = "verificati", min_score: int = 0,
-                paese: str = "", ordina: str = "punteggio", giorni: int = 0) -> list[sqlite3.Row]:
+                paese: str = "", ordina: str = "punteggio", giorni: int = 0,
+                fonte: str = "") -> list[sqlite3.Row]:
     where = ["hunt = ?", "hidden = 1" if esito == "eliminati" else "hidden = 0"]
     args: list = [hunt]
+    if fonte in SOURCES:
+        where.append("COALESCE(source, 'ebay') = ?")
+        args.append(fonte)
     if esito == "verificati":
         where.append("(score IS NOT NULL OR manual_verdict IS NOT NULL)")
     elif esito in MANUAL_VERDICTS:
@@ -222,6 +263,9 @@ border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:
 .bulk .all{font-size:13px;display:flex;gap:5px;align-items:center}
 .bulk input[type=text]{flex:1;min-width:140px}
 .flash{background:var(--chip);border-left:3px solid var(--hi);padding:8px 12px;border-radius:6px;margin-bottom:12px}
+form.f label.chk{flex-direction:row;align-items:center;gap:6px;font-size:13px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.chip.run{background:var(--mid);color:var(--card)}
 @media (max-width:640px){.item{grid-template-columns:64px 1fr}.thumb{width:64px;height:64px}
 .right{grid-column:1/-1;text-align:left;display:flex;gap:12px;align-items:center}}
 """
@@ -242,22 +286,38 @@ if(a==='elimina'&&!confirm('Eliminare '+n+' annunci dalla caccia?'))ev.preventDe
 </script>"""
 
 
-def page(title: str, body: str, hunts: list[str], current: str = "") -> str:
+def page(title: str, body: str, hunts: list[str], current: str = "", refresh: int = 0) -> str:
     nav = "".join(f'<a href="/caccia/{quote(h)}" class="{"on" if h == current else ""}">{e(h)}</a>' for h in hunts)
     nav += f'<a href="/giri" class="{"on" if current == "__giri" else ""}">Giri</a>'
-    return f"""<!doctype html><html lang="it"><head><meta charset="utf-8">
+    meta_refresh = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    return f"""<!doctype html><html lang="it"><head><meta charset="utf-8">{meta_refresh}
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)} · Scovatore</title>
 <style>{CSS}</style></head><body><header><div class="wrap top"><a class="brand" href="/">Scovatore</a>
 <nav>{nav}</nav></div></header><main class="wrap">{body}</main></body></html>"""
 
 
-def render_home(conn) -> tuple[str, list[str]]:
-    hs = hunts_overview(conn)
+def all_hunt_names(conn, defs: dict[str, Hunt]) -> list[str]:
+    """Cacce con annunci nel DB piu' quelle definite nei YAML che non hanno ancora girato."""
+    return sorted({h["hunt"] for h in hunts_overview(conn)} | set(defs))
+
+
+def render_home(conn, defs: dict[str, Hunt] | None = None) -> tuple[str, list[str]]:
+    defs = defs or {}
+    by_name = {h["hunt"]: h for h in hunts_overview(conn)}
+    for n in defs:   # caccia definita ma mai girata: compare lo stesso, con i contatori a zero
+        by_name.setdefault(n, {"hunt": n, "totale": 0, "verificati": 0, "conformi": 0, "attesa": 0,
+                               "eliminati": 0, "ultimo_nuovo": None, "ultimo_giro": last_run(conn, n)})
+    hs = [by_name[n] for n in sorted(by_name)]
     names = [h["hunt"] for h in hs]
     if not hs:
         return '<div class="empty">Nessun annuncio nel database: la prima caccia non ha ancora girato.</div>', names
     cards = []
     for h in hs:
+        fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>'
+                        for s in (defs[h["hunt"]].fonti if h["hunt"] in defs else []))
+        st = run_status(conn, h["hunt"])
+        stato = {"coda": '<span class="chip run">in coda</span>',
+                 "corso": '<span class="chip run">in corso</span>'}.get(st["stato"], "")
         r = h["ultimo_giro"]
         run_line = "nessun giro registrato"
         err = ""
@@ -272,7 +332,8 @@ def render_home(conn) -> tuple[str, list[str]]:
                 n = len(r["stats"]["errori"])
                 err = f'<div class="err">{n} error{"e" if n == 1 else "i"} nell\'ultimo giro: {e(r["stats"]["errori"][0][:120])}</div>'
         cards.append(f"""<a class="card" href="/caccia/{quote(h['hunt'])}" style="text-decoration:none;color:inherit">
-<h2>{e(h['hunt'])}</h2><div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
+<h2>{e(h['hunt'])}</h2><div class="meta" style="margin:-4px 0 6px">{fonti}{stato}</div>
+<div class="nums"><div><b class="s-hi">{h['conformi'] or 0}</b><span>conformi</span></div>
 <div><b>{h['verificati'] or 0}</b><span>verificati</span></div><div><b>{h['attesa'] or 0}</b><span>in attesa</span></div>
 <div><b>{h['totale']}</b><span>visti</span></div></div>
 {f'<div class="meta">{h["eliminati"]} eliminati a mano</div>' if h.get("eliminati") else ''}
@@ -307,13 +368,27 @@ def _btn(azione: str, lid: str, label: str, cls: str = "") -> str:
             f'{e(label)}</button>')
 
 
+def item_href(r, src: str, link_domain: str) -> str:
+    """Link all'annuncio: eBay con il dominio configurato, le altre fonti con il loro URL (solo http/https,
+    perche' arriva da dati esterni)."""
+    if src == "ebay":
+        return f"https://www.{link_domain}/itm/{r['legacy_id']}"
+    url = str(r["url"] or "")
+    return url if url.startswith(("https://", "http://")) else "#"
+
+
 def render_item(r: sqlite3.Row, link_domain: str = "ebay.it") -> str:
     keys = r.keys()
     v = json.loads(r["verify_json"] or "{}")
     img = r["image"] if "image" in keys else ""
     thumb = f'<img class="thumb" loading="lazy" src="{e(img)}" alt="">' if img else '<div class="thumb"></div>'
-    mp = (r["marketplace"] or "").removeprefix("EBAY_").lower()
-    chips = [f"da {r['country'] or '?'}", f"su ebay.{'co.uk' if mp == 'gb' else mp}" if mp else ""]
+    src = (r["source"] if "source" in keys else None) or "ebay"
+    if src == "ebay":
+        mp = (r["marketplace"] or "").removeprefix("EBAY_").lower()
+        chips = [f"da {r['country'] or '?'}", f"su ebay.{'co.uk' if mp == 'gb' else mp}" if mp else ""]
+    else:
+        chips = [f"su {SOURCE_LABELS.get(src, src)}"]
+    href = item_href(r, src, link_domain)
     if r["is_auction"]:
         chips.append("asta")
     if r["condition"]:
@@ -350,7 +425,7 @@ def render_item(r: sqlite3.Row, link_domain: str = "ebay.it") -> str:
     badge = '<span class="chip man">a mano</span>' if manual else ""
     return f"""<div class="item{' manual' if manual else ''}"><div class="thumbcol">
 <input type="checkbox" class="sel" name="id" value="{e(lid)}" aria-label="seleziona">{thumb}</div><div>
-<a class="title" href="https://www.{e(link_domain)}/itm/{e(r['legacy_id'])}" target="_blank" rel="noopener">{e(r['title'])}</a>
+<a class="title" href="{e(href)}" target="_blank" rel="noopener">{e(r['title'])}</a>
 <div class="meta">{chip_html}{' · visto ' + e(ago(r['first_seen']))}</div>
 {f'<div class="sintesi">{e(sintesi)}</div>' if sintesi else ''}
 <details><summary>Dettagli</summary>{detail}</details><div class="acts">{actions}</div></div>
@@ -359,7 +434,33 @@ def render_item(r: sqlite3.Row, link_domain: str = "ebay.it") -> str:
 <div class="meta">{badge}{e(esito)}</div></div></div>"""
 
 
-def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> str:
+def render_rerun(conn, hunt: str, info: Hunt | None, q: dict) -> tuple[str, dict]:
+    """Riquadro con il pulsante "Riesegui ora" e lo stato (in coda / in corso) della caccia."""
+    st = run_status(conn, hunt)
+    busy = st["stato"] != "libero"
+    fonti = info.fonti if info else []
+    opts = '<option value="">Tutte le fonti della caccia</option>' + "".join(
+        f'<option value="{s}">{e(SOURCE_LABELS[s])} soltanto</option>' for s in fonti if len(fonti) > 1)
+    if st["stato"] == "coda":
+        note = (f"Richiesta {ago(st['dal'])}, in coda: parte entro {POLL_HINT} secondi se il servizio e' libero, "
+                f"altrimenti appena finisce il giro in corso.")
+    elif st["stato"] == "corso":
+        note = f"Giro in corso da {ago(st['dal']).replace(' fa', '')}."
+    elif st.get("errore"):
+        note = f"L'ultima riesecuzione e' fallita: {st['errore'][:200]}"
+    else:
+        note = "Ignora l'intervallo di ricerca automatico e parte subito."
+    back = urlencode({k: v for k, v in q.items() if k not in ("msg", "token")})
+    form = f"""<form class="f" method="post" action="/caccia/{quote(hunt)}/riesegui">
+<input type="hidden" name="back" value="{e(back)}">
+<label>Cosa rieseguire<select name="fonte">{opts}</select></label>
+<label class="chk"><input type="checkbox" name="rigenera_piano" value="1"> Rigenera le query con l'LLM</label>
+<button{' disabled' if busy else ''}>Riesegui ora</button><span class="meta">{e(note)}</span></form>"""
+    return form, st
+
+
+def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it", info: Hunt | None = None) -> tuple[str, int]:
+    """Pagina della caccia. Ritorna (corpo, secondi di aggiornamento automatico: 0 = nessuno)."""
     esito = q.get("esito", "verificati") if q.get("esito") in ESITI else "verificati"
     ordina = q.get("ordina", "punteggio") if q.get("ordina") in ORDINI else "punteggio"
     try:
@@ -371,7 +472,8 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> str:
     except ValueError:
         giorni = 0
     paese = (q.get("paese") or "").upper()[:2]
-    rows = query_items(conn, hunt, esito, min_score, paese, ordina, giorni)
+    fonte = q.get("fonte", "") if q.get("fonte") in SOURCES else ""
+    rows = query_items(conn, hunt, esito, min_score, paese, ordina, giorni, fonte)
 
     def opts(d, cur):
         return "".join(f'<option value="{k}"{" selected" if k == cur else ""}>{e(v)}</option>' for k, v in d.items())
@@ -392,6 +494,7 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> str:
 <label>Esito<select name="esito">{opts(ESITI, esito)}</select></label>
 <label>Punteggio minimo<input type="number" name="min" min="0" max="100" value="{min_score}"></label>
 <label>Paese<select name="paese">{opts(paesi, paese)}</select></label>
+<label>Fonte<select name="fonte">{opts(FONTI, fonte)}</select></label>
 <label>Visti<select name="giorni">{opts(giorni_opt, str(giorni))}</select></label>
 <label>Ordina<select name="ordina">{opts(ORDINI, ordina)}</select></label>
 <button>Filtra</button></form>"""
@@ -407,7 +510,12 @@ def render_hunt(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> str:
 <button name="multipla" value="1">Applica ai selezionati</button></div>"""
     actions_form = (f'<form method="post" action="/caccia/{quote(hunt)}/azioni" id="lista">'
                     f'<input type="hidden" name="back" value="{e(back)}">{bulk if rows else ""}{items}</form>')
-    return f"<h1>{e(hunt)}</h1><p class='sub'>{e(sub)} · {len(rows)} annunci</p>{msg}{form}{actions_form}{more}{JS}"
+    rerun, st = render_rerun(conn, hunt, info, q)
+    fonti = "".join(f'<span class="chip">{e(SOURCE_LABELS[s])}</span>' for s in (info.fonti if info else []))
+    body = (f"<h1>{e(hunt)}</h1><p class='sub'>{fonti} {e(sub)} · {len(rows)} annunci</p>{msg}{rerun}{form}"
+            f"{actions_form}{more}{JS}")
+    # mentre c'e' una richiesta in coda o un giro in corso la pagina si aggiorna da sola
+    return body, (15 if st["stato"] != "libero" else 0)
 
 
 def render_runs(conn) -> str:
@@ -444,7 +552,8 @@ def apply_action(db_path: Path, hunt: str, form: dict[str, list[str]]) -> str:
     else:
         azione = (form.get("azione_multipla") or [""])[-1]
         ids = form.get("id") or []
-    ids = [i for i in dict.fromkeys(ids) if i and i.isdigit()][:1000]   # gli ID legacy sono numerici
+    # ID eBay numerici, oppure "fonte:numero" per Vinted e Subito: tutto il resto e' scartato
+    ids = [i for i in dict.fromkeys(ids) if ITEM_ID.fullmatch(i)][:1000]
     if azione not in AZIONI:
         return "Azione non riconosciuta."
     if not ids:
@@ -467,13 +576,38 @@ def apply_action(db_path: Path, hunt: str, form: dict[str, list[str]]) -> str:
     return f"{n} annuncio {AZIONI[azione][1]}." if n == 1 else f"{n} annunci {AZIONI[azione][2]}."
 
 
+def request_rerun(cfg: Config, hunt: str, form: dict[str, list[str]], names: list[str],
+                  defs: dict[str, Hunt]) -> str:
+    """Mette in coda la riesecuzione di una caccia (la esegue il loop) e ritorna il messaggio da mostrare."""
+    if hunt not in names:
+        return "Caccia sconosciuta."
+    fonte = (form.get("fonte") or [""])[-1].strip().lower()
+    if fonte and fonte not in SOURCES:
+        return "Fonte non riconosciuta."
+    if fonte and hunt in defs and fonte not in defs[hunt].fonti:
+        return (f"La fonte {SOURCE_LABELS[fonte]} non e' attiva in questa caccia: "
+                f"aggiungila al campo `fonti` del file YAML.")
+    rigenera = bool((form.get("rigenera_piano") or [""])[-1])
+    db = DB(cfg.db_path)
+    try:
+        rid = db.request_run(hunt, rigenera, [fonte] if fonte else None)
+    finally:
+        db.close()
+    log.info("web: riesecuzione di %s richiesta (fonte %s%s)", hunt, fonte or "tutte",
+             ", piano rigenerato" if rigenera else "")
+    if rid is None:
+        return "C'e' gia' una richiesta in coda per questa caccia."
+    return f"Riesecuzione messa in coda: parte entro {POLL_HINT} secondi se il servizio e' libero."
+
+
 def api_items(conn, hunt: str, q: dict, link_domain: str = "ebay.it") -> list[dict]:
     rows = query_items(conn, hunt, q.get("esito", "verificati"), int(q.get("min") or 0),
-                       (q.get("paese") or "").upper(), q.get("ordina", "punteggio"), int(q.get("giorni") or 0))
+                       (q.get("paese") or "").upper(), q.get("ordina", "punteggio"), int(q.get("giorni") or 0),
+                       q.get("fonte", ""))
     out = []
     for r in rows:
         d = dict(r)
-        d["link"] = f"https://www.{link_domain}/itm/{d['legacy_id']}"
+        d["link"] = item_href(r, (r["source"] or "ebay"), link_domain)
         d["verifica"] = json.loads(d.pop("verify_json") or "null")
         out.append(d)
     return out
@@ -520,13 +654,23 @@ def make_handler(cfg: Config):
             if not self._authorized({}) or not self._same_origin():
                 return self._send(403, page("Accesso", '<div class="empty">Azione non consentita.</div>', []))
             parts = [p for p in u.path.split("/") if p]
-            if len(parts) != 3 or parts[0] != "caccia" or parts[2] != "azioni":
+            if len(parts) != 3 or parts[0] != "caccia" or parts[2] not in ("azioni", "riesegui"):
                 return self._send(404, "non trovato", "text/plain")
             hunt = parts[1]
             length = min(int(self.headers.get("Content-Length") or 0), 200_000)
             form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
             try:
-                msg = apply_action(cfg.db_path, hunt, form)
+                if parts[2] == "riesegui":
+                    defs = hunt_defs(cfg)
+                    conn = connect(cfg.db_path)
+                    try:
+                        names = all_hunt_names(conn, defs) if conn else sorted(defs)
+                    finally:
+                        if conn:
+                            conn.close()
+                    msg = request_rerun(cfg, hunt, form, names, defs)
+                else:
+                    msg = apply_action(cfg.db_path, hunt, form)
             except Exception as exc:
                 log.exception("azione web fallita su %s", hunt)
                 msg = f"Errore: {exc}"
@@ -555,15 +699,17 @@ def make_handler(cfg: Config):
                 return self._send(200, page("Scovatore", f'<div class="empty">Database non trovato in '
                                                          f'{e(cfg.db_path)}: la prima caccia non ha ancora girato.</div>', []))
             try:
-                names = [h["hunt"] for h in hunts_overview(conn)]
+                defs = hunt_defs(cfg)
+                names = all_hunt_names(conn, defs)
                 parts = [p for p in u.path.split("/") if p]
                 if not parts:
-                    body, names = render_home(conn)
+                    body, names = render_home(conn, defs)
                     return self._send(200, page("Cacce", body, names))
                 if parts == ["giri"]:
                     return self._send(200, page("Giri", render_runs(conn), names, "__giri"))
                 if len(parts) == 2 and parts[0] == "caccia" and parts[1] in names:
-                    return self._send(200, page(parts[1], render_hunt(conn, parts[1], q, cfg.link_domain), names, parts[1]))
+                    body, refresh = render_hunt(conn, parts[1], q, cfg.link_domain, defs.get(parts[1]))
+                    return self._send(200, page(parts[1], body, names, parts[1], refresh))
                 if len(parts) == 3 and parts[:2] == ["api", "caccia"] and parts[2] in names:
                     return self._send(200, json.dumps(api_items(conn, parts[2], q, cfg.link_domain), ensure_ascii=False),
                                       "application/json; charset=utf-8")

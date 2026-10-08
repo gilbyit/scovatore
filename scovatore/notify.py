@@ -8,7 +8,7 @@ import httpx
 
 from .config import Config
 from .db import DB
-from .hunt import Hunt
+from .hunt import SOURCE_LABELS, Hunt
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +27,12 @@ def notify(hunt: Hunt, db: DB, cfg: Config, transport: httpx.BaseTransport | Non
     with httpx.Client(timeout=15, transport=transport) as http:
         for r in rows:
             v = json.loads(r["verify_json"] or "{}")
-            body = f"{r['total']:.2f} {r['currency']} | {r['score']}/100\n{v.get('sintesi', '')}"
+            src = r["source"] if "source" in r.keys() and r["source"] not in (None, "ebay") else ""
+            body = (f"{r['total']:.2f} {r['currency']} | {r['score']}/100"
+                    f"{' | ' + SOURCE_LABELS.get(src, src) if src else ''}\n{v.get('sintesi', '')}")
             # titolo e link come query string: gli header HTTP non reggono caratteri non ASCII
-            params = {"title": f"[{hunt.nome}] {r['title'][:80]}", "click": cfg.item_link(r["legacy_id"]), "tags": "mag"}
+            params = {"title": f"[{hunt.nome}] {r['title'][:80]}",
+                      "click": cfg.item_link(r["legacy_id"], r["url"] or ""), "tags": "mag"}
             try:
                 resp = http.post(cfg.ntfy_url, content=body.encode("utf-8"), params=params,
                                  headers=headers_base)

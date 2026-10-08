@@ -51,6 +51,25 @@ EU27: frozenset[str] = frozenset({
 # nella loro lingua. Una query tedesca lanciata su ebay.it trova il venditore di Berlino.
 EU_LANGS: list[str] = ["it", "en", "de", "fr", "es", "nl", "pl"]
 
+# Fonti di annunci attivabili da una caccia (campo `fonti`). eBay usa la Browse API ufficiale;
+# Vinted e Subito non hanno API pubbliche e si leggono dai loro endpoint web (vedi sources/).
+SOURCES = ("ebay", "vinted", "subito")
+SOURCE_LABELS = {"ebay": "eBay", "vinted": "Vinted", "subito": "Subito"}
+SOURCE_ALIASES = {"subito.it": "subito", "vinted.it": "vinted", "ebay.it": "ebay"}
+
+# Domini Vinted -> (suffisso del sito, lingua delle query)
+VINTED_DOMAINS: dict[str, tuple[str, str]] = {
+    "it": ("it", "it"), "fr": ("fr", "fr"), "de": ("de", "de"), "es": ("es", "es"),
+    "nl": ("nl", "nl"), "pl": ("pl", "pl"), "be": ("be", "fr"), "at": ("at", "de"),
+    "lu": ("lu", "fr"), "pt": ("pt", "en"), "lt": ("lt", "en"), "cz": ("cz", "en"),
+}
+# Stato dell'oggetto su Vinted: alias leggibili -> status_ids
+VINTED_STATUS: dict[str, list[int]] = {
+    "nuovo_cartellino": [6], "nuovo": [6, 1], "ottimo": [2], "buono": [3], "discreto": [4],
+}
+VINTED_ORDER = {"newest_first", "relevance", "price_low_to_high", "price_high_to_low"}
+SUBITO_ORDER = {"datedesc", "priceasc", "pricedesc"}
+
 VALID_BUYING = {"FIXED_PRICE", "AUCTION", "BEST_OFFER"}
 VALID_REGIONS = {"EUROPEAN_UNION", "CONTINENTAL_EUROPE", "BORDER_COUNTRIES", "WORLDWIDE",
                  "UK_AND_IRELAND", "NORTH_AMERICA", "ASIA"}
@@ -69,6 +88,7 @@ class EbayParams:
     prezzo_max: float | None = None
     spedizione_inclusa: bool = True          # il budget vale su prezzo + spedizione
     spedizione_ignota: str = "scarta_estero"  # tieni | scarta | scarta_estero: annunci senza costo di spedizione noto
+    spedizione_max: float | None = None       # scarta se la spedizione costa di piu' (controllo locale)
     regione: str | None = "EUROPEAN_UNION"   # itemLocationRegion
     paese: str | None = None                  # itemLocationCountry (alternativo a regione)
     consegna_paese: str | None = "IT"         # deliveryCountry
@@ -93,11 +113,42 @@ class EbayParams:
 
 
 @dataclass
+class VintedParams:
+    """Parametri della fonte Vinted (sezione `vinted` della caccia). Tutto facoltativo."""
+    domini: list[str] = field(default_factory=lambda: ["it"])   # vinted.it, vinted.fr, ...
+    valuta: str = "EUR"
+    prezzo_min: float | None = None           # se omessi valgono quelli della sezione `ebay`
+    prezzo_max: float | None = None
+    spedizione_stimata: float | None = None   # sommata al prezzo per il budget; None = si guarda solo il prezzo
+    condizioni: list[int] = field(default_factory=list)   # status_ids (alias: nuovo, ottimo, buono, discreto)
+    categorie: list[int] = field(default_factory=list)    # catalog_ids di Vinted
+    ordinamento: str = "newest_first"
+    max_risultati_per_query: int = 48
+    max_ricerche: int = 20                    # tetto di ricerche (query x dominio) per giro
+
+
+@dataclass
+class SubitoParams:
+    """Parametri della fonte Subito.it (sezione `subito` della caccia). Tutto facoltativo."""
+    regione: str = "italia"                   # slug nell'URL: italia, piemonte, lombardia, ...
+    categoria: str = "usato"                  # slug nell'URL: usato, informatica, audio-video, ...
+    valuta: str = "EUR"
+    prezzo_min: float | None = None           # se omessi valgono quelli della sezione `ebay`
+    prezzo_max: float | None = None           # il filtro prezzo e' sempre locale
+    ordinamento: str = "datedesc"
+    max_risultati_per_query: int = 50
+    max_ricerche: int = 12
+
+
+@dataclass
 class Hunt:
     nome: str
     ricerca: str
     requisiti_avanzati: str = ""
+    fonti: list[str] = field(default_factory=lambda: ["ebay"])   # quali ricerche attivare
     ebay: EbayParams = field(default_factory=EbayParams)
+    vinted: VintedParams = field(default_factory=VintedParams)
+    subito: SubitoParams = field(default_factory=SubitoParams)
     query_extra: list[str] = field(default_factory=list)    # query manuali, aggiunte a quelle di Palantir
     parole_escluse: list[str] = field(default_factory=list)  # scarto locale sul titolo
     screening: bool = True                    # passaggio Palantir sui titoli
@@ -122,8 +173,22 @@ class Hunt:
     def languages(self) -> list[str]:
         langs = set(self.lingue if self.lingue else EU_LANGS)
         langs |= {MARKETPLACE_LANG.get(m, "en") for m in self.ebay.marketplaces}
+        if "vinted" in self.fonti:
+            langs |= {VINTED_DOMAINS[d][1] for d in self.vinted.domini}
+        if "subito" in self.fonti:
+            langs.add("it")
         langs.add("en")  # per l'hardware l'inglese rende ovunque
         return sorted(langs)
+
+    def uses(self, source: str) -> bool:
+        return source in self.fonti
+
+    def price_limits(self, source: str) -> tuple[float | None, float | None]:
+        """(min, max) del budget per una fonte: la sezione della fonte, altrimenti quella di eBay."""
+        p = getattr(self, source)
+        lo = p.prezzo_min if p.prezzo_min is not None else self.ebay.prezzo_min
+        hi = p.prezzo_max if p.prezzo_max is not None else self.ebay.prezzo_max
+        return lo, hi
 
     def reference_text(self) -> str:
         if not self.dati_riferimento:
@@ -207,6 +272,93 @@ def _countries(raw) -> list[str] | None:
     return sorted(out)
 
 
+def _sources(raw) -> list[str]:
+    """`fonti`: lista (o stringa) di eBay / Vinted / Subito. Default: solo eBay."""
+    if raw is None:
+        return ["ebay"]
+    items = [raw] if isinstance(raw, str) else list(raw)
+    out: list[str] = []
+    for s in items:
+        s = str(s).strip().lower()
+        s = SOURCE_ALIASES.get(s, s)
+        if s not in SOURCES:
+            raise HuntError(f"fonte sconosciuta: {s!r} (valide: {', '.join(SOURCES)})")
+        if s not in out:
+            out.append(s)
+    if not out:
+        raise HuntError("fonti e' vuoto: attiva almeno una fonte (ebay, vinted, subito)")
+    return out
+
+
+def _section(data: dict, key: str, cls):
+    """Legge una sezione di parametri (`vinted`, `subito`) controllando i nomi."""
+    raw = data.get(key)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise HuntError(f"{key} deve essere una sezione di parametri")
+    unknown = set(raw) - set(cls.__dataclass_fields__)
+    if unknown:
+        raise HuntError(f"parametri {key} sconosciuti: {sorted(unknown)}")
+    return dict(raw)
+
+
+def _check_limits(name: str, p) -> None:
+    if p.prezzo_min is not None and p.prezzo_max is not None and p.prezzo_min > p.prezzo_max:
+        raise HuntError(f"{name}: prezzo_min e' maggiore di prezzo_max")
+    if not 1 <= p.max_ricerche <= 500:
+        raise HuntError(f"{name}.max_ricerche deve stare fra 1 e 500")
+    if not 1 <= p.max_risultati_per_query <= 500:
+        raise HuntError(f"{name}.max_risultati_per_query deve stare fra 1 e 500")
+
+
+def _vinted(data: dict) -> VintedParams:
+    v = _section(data, "vinted", VintedParams)
+    raw_dom = v.get("domini")
+    if raw_dom is not None:
+        items = [raw_dom] if isinstance(raw_dom, str) else list(raw_dom)
+        doms: list[str] = []
+        for d in items:
+            d = str(d).strip().lower().removeprefix("vinted.").removeprefix("www.")
+            if d not in VINTED_DOMAINS:
+                raise HuntError(f"dominio Vinted sconosciuto: {d!r} (validi: {', '.join(sorted(VINTED_DOMAINS))})")
+            if d not in doms:
+                doms.append(d)
+        if not doms:
+            raise HuntError("vinted.domini e' vuoto")
+        v["domini"] = doms
+    conds: list[int] = []
+    for c in v.get("condizioni") or []:
+        if isinstance(c, int) or (isinstance(c, str) and c.isdigit()):
+            conds.append(int(c))
+        elif isinstance(c, str) and c.lower() in VINTED_STATUS:
+            conds.extend(VINTED_STATUS[c.lower()])
+        else:
+            raise HuntError(f"condizione Vinted sconosciuta: {c!r} (usa un ID o {sorted(VINTED_STATUS)})")
+    v["condizioni"] = sorted(set(conds))
+    v["categorie"] = [int(c) for c in v.get("categorie") or []]
+    vp = VintedParams(**v)
+    if vp.ordinamento not in VINTED_ORDER:
+        raise HuntError(f"vinted.ordinamento non valido: {vp.ordinamento} (validi: {sorted(VINTED_ORDER)})")
+    _check_limits("vinted", vp)
+    return vp
+
+
+def _subito(data: dict) -> SubitoParams:
+    s = _section(data, "subito", SubitoParams)
+    for key in ("regione", "categoria"):
+        if key in s:
+            slug = _slug(str(s[key]))
+            if not slug:
+                raise HuntError(f"subito.{key} non valido: {s[key]!r}")
+            s[key] = slug
+    sp = SubitoParams(**s)
+    if sp.ordinamento not in SUBITO_ORDER:
+        raise HuntError(f"subito.ordinamento non valido: {sp.ordinamento} (validi: {sorted(SUBITO_ORDER)})")
+    _check_limits("subito", sp)
+    return sp
+
+
 def parse_hunt(data: dict, path: Path | None = None) -> Hunt:
     if not isinstance(data, dict):
         raise HuntError("il file della caccia deve essere un dizionario YAML")
@@ -246,17 +398,21 @@ def parse_hunt(data: dict, path: Path | None = None) -> Hunt:
         raise HuntError("max_ricerche deve stare fra 1 e 2000")
     if not 1 <= ep.max_risultati_per_query <= 1000:
         raise HuntError("max_risultati_per_query deve stare fra 1 e 1000")
+    if ep.spedizione_max is not None and ep.spedizione_max < 0:
+        raise HuntError("spedizione_max non puo' essere negativa")
 
-    top_known = set(Hunt.__dataclass_fields__) - {"path", "ebay"}
-    unknown_top = set(data) - top_known - {"ebay"}
+    nested = {"path", "ebay", "vinted", "subito"}
+    top_known = set(Hunt.__dataclass_fields__) - nested
+    unknown_top = set(data) - top_known - nested
     if unknown_top:
         raise HuntError(f"campi sconosciuti: {sorted(unknown_top)}")
 
     fields = {k: v for k, v in data.items() if k in top_known}
     if "lingue" in fields:
         fields["lingue"] = _languages(fields["lingue"])
+    fields["fonti"] = _sources(data.get("fonti"))
     fields["nome"] = _slug(str(data.get("nome") or (path.stem if path else "caccia")))
-    return Hunt(ebay=ep, path=path, **fields)
+    return Hunt(ebay=ep, vinted=_vinted(data), subito=_subito(data), path=path, **fields)
 
 
 def load_hunt(path: str | Path) -> Hunt:

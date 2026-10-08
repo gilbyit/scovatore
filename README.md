@@ -1,16 +1,16 @@
 # Scovatore
 
-Cacciatore di annunci eBay per NASGUL. Gli descrivi a parole cosa cerchi, senza marca e modello, e lui:
+Cacciatore di annunci per NASGUL (eBay, Vinted, Subito.it). Gli descrivi a parole cosa cerchi, senza marca e modello, e lui:
 
 1. fa generare a **Palantir** o a **Groq** (a scelta, `SCOVATORE_PLAN_LLM`) le query di ricerca (sinonimi, varianti, più lingue);
-2. lancia le ricerche sulla **Browse API** di eBay con i filtri strutturati (prezzo, area geografica, condizione...);
+2. lancia le ricerche sulle fonti attive della caccia: la **Browse API** di eBay con i filtri strutturati (prezzo, area geografica, condizione...) e, se richiesti, **Vinted** e **Subito.it**;
 3. scarta in locale quello che non rientra (budget con spedizione, valuta, parole escluse, feedback);
 4. fa scremare i titoli a **Palantir**, a blocchi (si / forse / no);
 5. manda i sopravvissuti, con descrizione e specifiche complete, a **Groq** per la verifica dei requisiti avanzati;
 6. salva tutto in SQLite, stila una classifica e, se configurato, notifica via **ntfy** i nuovi annunci sopra soglia;
 7. mostra i risultati in una piccola **interfaccia web** (servizio `scovatore-web`, porta 8482).
 
-Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
+eBay usa l'API ufficiale, gratuita con un account developer. Vinted e Subito.it non hanno un'API pubblica: si leggono gli stessi endpoint dei loro siti, con tutti i limiti descritti in [Vinted e Subito](#vinted-e-subito). Ogni fonte si attiva per caccia con il campo `fonti`.
 
 ```
  cacce/*.yaml
@@ -19,7 +19,8 @@ Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
  [Palantir] piano ---> query per lingua (in cache finche' la ricerca non cambia)
       |
       v
- [eBay Browse API] ricerca x marketplace x query  (filtri eBay = parametri YAML)
+ [fonti] eBay Browse API / Vinted / Subito.it, solo quelle in `fonti`
+      ricerca x marketplace (o dominio, o regione) x query
       |
       v
  filtri locali: totale con spedizione, valuta, parole escluse, feedback
@@ -28,7 +29,7 @@ Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
  [Palantir] scrematura titoli a blocchi ---> "no" scartati
       |
       v
- [eBay] dettaglio annuncio  +  [Groq] verifica requisiti avanzati ---> punteggio 0-100
+ [fonte] dettaglio annuncio  +  [Groq] verifica requisiti avanzati ---> punteggio 0-100
       |
       v
  SQLite  ->  classifica / CSV / notifica ntfy
@@ -39,7 +40,7 @@ Niente scraping HTML: usa l'API ufficiale, gratuita con un account developer.
 | Cosa | Chi | Perché |
 |---|---|---|
 | Prezzo, valuta, area geografica, paese di consegna, condizione, formato, venditori | eBay (parametri YAML) | eBay li filtra meglio e gratis |
-| Budget con spedizione inclusa, parole escluse, feedback minimo | Scovatore in locale | deterministico, zero token |
+| Budget con spedizione inclusa, parole escluse, feedback minimo, prezzo su Subito.it | Scovatore in locale | deterministico, zero token |
 | Query sinonime a partire dagli elementi chiave | Palantir o Groq (`SCOVATORE_PLAN_LLM`) | una sola chiamata per caccia, poi in cache: con Groq costa poche centinaia di token e sbaglia meno |
 | Scrematura dei titoli | Palantir | taglia il rumore prima di spendere token Groq |
 | Requisiti avanzati (TDP, PassMark, diagnosi da sintomi...) | Groq | serve conoscenza di dominio, un modello da 4B non basta |
@@ -84,7 +85,7 @@ docker compose up -d --build
 docker logs -f scovatore
 ```
 
-Il container gira in `loop`: ogni 10 minuti controlla quali cacce sono scadute (campo `ogni_minuti`) e le esegue. Cacce e dati di riferimento sono montati in sola lettura: per aggiungere o modificare una caccia basta toccare il file YAML, senza riavviare.
+Il container gira in `loop`: ogni 10 minuti controlla quali cacce sono scadute (campo `ogni_minuti`) e le esegue; ogni 10 secondi controlla anche le richieste "Riesegui ora" arrivate dall'interfaccia web. Cacce e dati di riferimento sono montati in sola lettura (anche nel servizio web, che li legge per mostrare le fonti di ogni caccia): per aggiungere o modificare una caccia basta toccare il file YAML, senza riavviare.
 
 Comandi a mano dentro il container:
 
@@ -103,6 +104,7 @@ python -m scovatore controlla                         # .env e cacce valide?
 python -m scovatore piano ampli-guasto                # solo query di Palantir, nessuna chiamata eBay
 python -m scovatore piano ampli-guasto --rigenera     # ignora il piano in cache
 python -m scovatore esegui ampli-guasto               # giro completo + classifica
+python -m scovatore esegui ampli-guasto --fonte vinted   # solo una fonte (ripetibile: --fonte vinted --fonte subito)
 python -m scovatore tutte [--forza]                   # tutte le cacce attive scadute
 python -m scovatore loop --intervallo 10              # modalità servizio
 python -m scovatore risultati ampli-guasto --min 60 --csv ampli.csv
@@ -116,12 +118,13 @@ python -m scovatore risultati ampli-guasto --tutti    # anche i non verificati
 Il compose avvia anche `scovatore-web`, che lavora sullo stesso database del servizio:
 
 - `http://nasgul:8482/`: riepilogo delle cacce (conformi, verificati, in attesa, ultimo giro ed eventuali errori);
-- `/caccia/<nome>`: classifica filtrabile per esito, punteggio minimo, paese, periodo, con ordinamento per punteggio, prezzo o novità. Ogni annuncio ha il dettaglio della verifica (requisiti, fonte del dato, rischi, domande al venditore) e il motivo della scrematura;
+- `/caccia/<nome>`: classifica filtrabile per esito, punteggio minimo, fonte, paese, periodo, con ordinamento per punteggio, prezzo o novità. Ogni annuncio ha il dettaglio della verifica (requisiti, fonte del dato, rischi, domande al venditore) e il motivo della scrematura;
 - **interventi manuali**, su un annuncio (pulsanti sotto la scheda) o su più annunci (caselle + barra in alto, con nota facoltativa):
   - **Conforme / Incerto / Non conforme**: l'esito dell'operatore prevale su quello del modello, che resta visibile nel dettaglio ("il modello diceva: ..."). Groq non lo sovrascrive più, nemmeno se il prezzo cambia; **Togli correzione** torna al giudizio del modello;
   - **Riverifica**: rimette l'annuncio in coda per Groq al prossimo giro, anche se la scrematura lo aveva scartato (serve che l'annuncio sia ancora online e ricompaia nelle ricerche);
   - **Elimina**: toglie l'annuncio dalla caccia. Non viene cancellato dal DB, altrimenti eBay lo restituirebbe al giro dopo e ripartirebbero scrematura e verifica: resta marcato, la pipeline lo ignora e non lo notifica, e si ripristina dalla vista **Eliminati**;
   - la vista **Corretti a mano** raccoglie gli interventi: è il materiale giusto per capire dove sbagliano i prompt;
+- **Riesegui ora** (in cima alla pagina di ogni caccia): forza un giro senza aspettare `ogni_minuti`, anche per una caccia disattivata. Si sceglie cosa rieseguire (tutta la caccia o una sola fonte) e se rigenerare le query con l'LLM. Il servizio web non esegue nulla: scrive la richiesta nel database e il container `scovatore` la prende entro 10 secondi. La pagina mostra "in coda" / "in corso" e si aggiorna da sola; una richiesta già in coda non si duplica. Un giro parziale (una sola fonte) non sposta la scadenza di `ogni_minuti`;
 - `/giri`: gli ultimi giri di tutte le cacce con durata di ogni fase, contatori ed errori;
 - `/api/caccia/<nome>` e `/api/giri`: gli stessi dati in JSON (accettano gli stessi parametri della pagina), utili per GILPA.
 
@@ -159,6 +162,8 @@ ebay:                          # tutto quello che eBay sa filtrare
   consegna_paese: IT
   condizioni: [guasto]
 
+fonti: [ebay]                  # facoltativo: ebay, vinted, subito (default: solo eBay)
+
 ricerca: >                     # per Palantir: cosa cercare
   Amplificatore audio hi-fi guasto o non funzionante, venduto per ricambi.
 
@@ -190,6 +195,7 @@ requisiti_avanzati: |          # per Groq: cosa verificare sul dettaglio
 | `categorie` | nessuna | `category_ids` per marketplace: `{EBAY_IT: [1244], EBAY_DE: [1244]}` |
 | `ordinamento` | `newlyListed` | `sort`: `price`, `-price`, `newlyListed`, `endingSoonest` |
 | `max_risultati_per_query` | `100` | paginazione, massimo 200 per pagina |
+| `spedizione_max` | nessuno | tetto alla sola spedizione, in euro (controllo locale, solo eBay) |
 | `feedback_minimo` | nessuno | % minima di feedback del venditore (controllo locale) |
 
 #### Tutta la UE, cercando solo su ebay.it
@@ -213,13 +219,47 @@ Cercare anche su ebay.de & co. (`marketplaces: ue`) resta possibile, ma porta an
 
 Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabile solo insieme a una categoria foglia. Senza `categorie` è meglio lasciarlo vuoto: altrimenti si rischiano risultati mancanti.
 
+### Fonti: `fonti`, sezione `vinted`, sezione `subito`
+
+`fonti` elenca le ricerche attive per la caccia (`ebay`, `vinted`, `subito`; accetta anche `subito.it`). Se manca vale `[ebay]`, quindi le cacce esistenti non cambiano. Una fonte non elencata non gira e non consuma richieste. Esempio completo, disattivato: `cacce/esempio-fonti.yaml`.
+
+**Prezzo**: `prezzo_min` / `prezzo_max` di `vinted` e `subito` valgono per quella fonte; se omessi valgono quelli della sezione `ebay`.
+
+#### Sezione `vinted`
+
+| Campo | Default | Effetto |
+|---|---|---|
+| `domini` | `[it]` | siti Vinted da interrogare: `it, fr, de, es, nl, pl, be, at, lu, pt, lt, cz`. Ogni dominio riceve le query nella sua lingua |
+| `valuta` | `EUR` | gli annunci in altra valuta vengono scartati |
+| `prezzo_min`, `prezzo_max` | quelli di `ebay` | `price_from` / `price_to` |
+| `spedizione_stimata` | nessuna | sommata al prezzo per il budget. Vinted non espone la spedizione nell'elenco: senza questo valore si guarda solo il prezzo |
+| `condizioni` | tutte | stato dichiarato dal venditore: `nuovo_cartellino`, `nuovo`, `ottimo`, `buono`, `discreto`, oppure ID numerici (`status_ids`) |
+| `categorie` | nessuna | `catalog_ids` di Vinted |
+| `ordinamento` | `newest_first` | `relevance`, `price_low_to_high`, `price_high_to_low` |
+| `max_risultati_per_query` | `48` | massimo 96 per pagina |
+| `max_ricerche` | `20` | tetto di richieste (query x dominio) per giro |
+
+#### Sezione `subito`
+
+| Campo | Default | Effetto |
+|---|---|---|
+| `regione` | `italia` | slug della regione nell'URL (`piemonte`, `lombardia`...). Molti annunci sono solo a ritiro |
+| `categoria` | `usato` | slug della categoria (`informatica`, `audio-video`...) |
+| `valuta` | `EUR` | etichetta della valuta |
+| `prezzo_min`, `prezzo_max` | quelli di `ebay` | **solo controllo locale**: nell'URL di Subito i filtri di prezzo sono indici di fasce |
+| `ordinamento` | `datedesc` | `priceasc`, `pricedesc` |
+| `max_risultati_per_query` | `50` | circa 30 annunci per pagina |
+| `max_ricerche` | `12` | tetto di richieste per giro |
+
+Spedizione su Subito: non esiste nell'elenco, il totale è il prezzo.
+
 ### Altri campi
 
 | Campo | Default | Uso |
 |---|---|---|
 | `ricerca` | obbligatorio | testo libero per Palantir: cosa cercare. Solo gli elementi che finiscono nei titoli degli annunci |
 | `requisiti_avanzati` | vuoto | testo libero per Groq: i criteri che richiedono conoscenza o lettura della descrizione |
-| `query_extra` | `[]` | query scritte a mano, usate su tutti i marketplace insieme a quelle generate |
+| `query_extra` | `[]` | query scritte a mano, usate su tutte le fonti insieme a quelle generate |
 | `parole_escluse` | `[]` | scarto locale sul titolo, a parola intera. Si sommano a quelle proposte da Palantir |
 | `screening` | `true` | scrematura dei titoli con Palantir. Con `false` va tutto a Groq (attenzione ai token) |
 | `dati_riferimento` | nessuno | file di testo o CSV, percorso relativo al file YAML, passato a Groq come fonte da preferire alla sua memoria |
@@ -230,9 +270,9 @@ Nota: secondo la documentazione eBay, `buyingOptions` funziona in modo affidabil
 
 ## Cosa rigira e cosa no
 
-Ogni giro ricerca sempre su eBay, ma i passaggi LLM si ripetono solo quando serve:
+Ogni giro ricerca sempre su tutte le fonti attive, ma i passaggi LLM si ripetono solo quando serve:
 
-- **piano**: in cache finché non cambiano `ricerca`, marketplace (lingue), `max_query_per_lingua`, condizioni, il modello che lo genera o il prompt. Forzabile con `--rigenera` / `--rigenera-piano`;
+- **piano**: uno per fonte (per Vinted e Subito le parole di stato restano nelle query, perché il sito non le filtra; se due fonti hanno lo stesso piano la chiamata è una sola). In cache finché non cambiano `ricerca`, marketplace (lingue), `max_query_per_lingua`, condizioni, il modello che lo genera o il prompt. Forzabile con `--rigenera` / `--rigenera-piano` o dalla casella dell'interfaccia web;
 - **scrematura**: una volta per annuncio;
 - **verifica Groq**: una volta per annuncio, ripetuta se cambiano `ricerca`, `requisiti_avanzati` o `dati_riferimento`, oppure se il prezzo totale si muove di oltre il 5% (aste, ribassi);
 - **notifica**: una volta per annuncio, mai per quelli eliminati o corretti a mano.
@@ -268,6 +308,18 @@ Il campo `fonte` distingue un dato letto nell'annuncio, preso dai dati di riferi
 - **Stesso annuncio su più marketplace**: deduplicato per ID legacy, tenendo il totale più basso.
 - **Descrizioni troncate** a `SCOVATORE_DESC_MAX_CHARS` per contenere i token. Se un venditore scrive i sintomi in fondo a una descrizione lunga, Groq non li vede.
 
+## Vinted e Subito
+
+Sono la parte fragile di Scovatore. Leggi prima di affidarti ai risultati.
+
+- **Non sono API ufficiali.** Vinted si interroga con l'endpoint JSON che usa il suo sito (`/api/v2/catalog/items`, cookie di sessione preso dalla home); Subito.it con il JSON `__NEXT_DATA__` incorporato nella pagina dei risultati. Possono cambiare senza preavviso. In quel caso la fonte segnala l'errore ("formato cambiato", "pagina di blocco") invece di restituire zero risultati in silenzio, e il giro prosegue con le altre fonti.
+- **Condizioni d'uso.** Entrambi i siti vietano o limitano la lettura automatica. Scovatore lavora in modo educato (pausa `SCOVATORE_SCRAPE_DELAY` fra le richieste, poche ricerche per giro, nessun login) e **non aggira i blocchi**: davanti a un 403/429 la fonte si ferma per quel giro, e dopo 3 errori consecutivi pure. Resta una tua valutazione se e quanto usarli; per uso personale e a bassa frequenza il rischio pratico è un blocco temporaneo dell'IP.
+- **Cosa non è verificato.** Il codice è stato scritto e testato contro risposte simulate, dalla struttura nota dei due siti. Parametri e percorsi del JSON (`status_ids[]`, `catalog[]`, valori di `order`, `total_item_price`, percorso in `__NEXT_DATA__`) vanno confermati al primo giro reale: lancia `esempio-fonti` con "Riesegui ora" o `esegui --fonte vinted -v` e guarda il log.
+- **Spedizione sconosciuta.** Né Vinted né Subito la danno nell'elenco: su Vinted si usa `spedizione_stimata`, su Subito il prezzo è il totale (e spesso si ritira a mano).
+- **Nessuna garanzia di stato.** Il guasto non è filtrabile dal sito: lo giudica Groq dalla descrizione, quindi scrivi in `requisiti_avanzati` di scartare gli oggetti funzionanti.
+- **ID.** Gli annunci di queste fonti hanno ID con prefisso (`vinted:123`, `subito:456`) e il link punta all'annuncio originale; gli ID eBay restano quelli di sempre.
+- **Costo.** Ogni annuncio verificato richiede una richiesta di dettaglio alla pagina del sito, oltre al token Groq.
+
 ## Struttura
 
 ```
@@ -275,10 +327,11 @@ scovatore/
   config.py     configurazione da .env
   hunt.py       schema e validazione delle cacce YAML
   ebay.py       client Browse API (OAuth, search, getItem, filtri)
+  sources/      fonti web senza API: base.py (pausa, blocchi, URL sicuri), vinted.py, subito.py
   llm.py        client OpenAI-compatible con limitatore di token ed estrazione JSON robusta
   prompts.py    i tre prompt (piano, scrematura, verifica): si ritoccano qui
   pipeline.py   orchestrazione di un giro
-  db.py         SQLite: piani, esecuzioni, annunci, verdetti
+  db.py         SQLite: piani, esecuzioni, annunci, verdetti, richieste di riesecuzione
   notify.py     ntfy
   web.py        interfaccia web con interventi manuali (solo libreria standard)
   cli.py        comandi
@@ -295,7 +348,7 @@ pip install pytest
 python -m pytest -q
 ```
 
-I test non chiamano servizi esterni: eBay, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, alias `ue` e filtro paesi, tetto di ricerche, migrazione del DB, pagine e token dell'interfaccia web, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay.
+I test non chiamano servizi esterni: eBay, Vinted, Subito.it, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, alias `ue` e filtro paesi, tetto di ricerche, migrazione del DB, pagine e token dell'interfaccia web, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay, parsing e isolamento dei guasti delle fonti web, coda delle riesecuzioni dal web.
 
 ## Integrazione con GILPA (prossimo passo)
 

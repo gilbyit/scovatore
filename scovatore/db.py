@@ -53,9 +53,21 @@ CREATE TABLE IF NOT EXISTS items (
     manual_verdict TEXT,          -- esito deciso dall'operatore, prevale su quello del modello
     manual_note TEXT,
     manual_at TEXT,
+    source TEXT DEFAULT 'ebay',   -- ebay | vinted | subito
     PRIMARY KEY (hunt, legacy_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_score ON items(hunt, score DESC);
+-- Richieste di riesecuzione dall'interfaccia web: le scrive il container web, le esegue il loop
+CREATE TABLE IF NOT EXISTS run_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hunt TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    rigenera_piano INTEGER DEFAULT 0,
+    fonti TEXT,                   -- NULL = tutte le fonti della caccia; altrimenti "ebay,vinted"
+    claimed_at TEXT,              -- presa in carico dal loop
+    finished_at TEXT,
+    error TEXT
+);
 """
 
 # Colonne aggiunte dopo la prima versione: (tabella, colonna, tipo). Applicate all'avvio se mancano.
@@ -65,7 +77,12 @@ MIGRATIONS = [
     ("items", "manual_verdict", "TEXT"),
     ("items", "manual_note", "TEXT"),
     ("items", "manual_at", "TEXT"),
+    ("items", "source", "TEXT DEFAULT 'ebay'"),
+    ("runs", "parziale", "INTEGER DEFAULT 0"),   # 1 = giro su una parte delle fonti: non azzera ogni_minuti
 ]
+
+# Un giro senza data di fine piu' vecchio di cosi' e' un crash, non un giro in corso
+STALE_RUN_HOURS = 3
 
 MANUAL_VERDICTS = ("conforme", "incerto", "non_conforme")
 
@@ -101,8 +118,9 @@ class DB:
         self.conn.commit()
 
     # --- esecuzioni ---------------------------------------------------
-    def start_run(self, hunt: str) -> int:
-        cur = self.conn.execute("INSERT INTO runs (hunt, started_at) VALUES (?,?)", (hunt, now()))
+    def start_run(self, hunt: str, parziale: bool = False) -> int:
+        cur = self.conn.execute("INSERT INTO runs (hunt, started_at, parziale) VALUES (?,?,?)",
+                                (hunt, now(), int(parziale)))
         self.conn.commit()
         return int(cur.lastrowid)
 
@@ -112,9 +130,51 @@ class DB:
         self.conn.commit()
 
     def last_run_at(self, hunt: str) -> str | None:
-        r = self.conn.execute("SELECT MAX(started_at) AS t FROM runs WHERE hunt=? AND error IS NULL",
-                              (hunt,)).fetchone()
+        """Avvio dell'ultimo giro completo riuscito (quelli parziali non contano per ogni_minuti)."""
+        r = self.conn.execute(
+            "SELECT MAX(started_at) AS t FROM runs WHERE hunt=? AND error IS NULL AND COALESCE(parziale, 0)=0",
+            (hunt,)).fetchone()
         return r["t"] if r else None
+
+    def run_in_progress(self, hunt: str) -> bool:
+        """True se c'e' un giro senza data di fine e abbastanza recente da non essere un crash."""
+        r = self.conn.execute(
+            """SELECT 1 FROM runs WHERE hunt=? AND finished_at IS NULL
+               AND started_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', ?) LIMIT 1""",
+            (hunt, f"-{STALE_RUN_HOURS} hours")).fetchone()
+        return r is not None
+
+    # --- richieste di riesecuzione (interfaccia web -> loop) ----------
+    def request_run(self, hunt: str, rigenera_piano: bool = False, fonti: list[str] | None = None) -> int | None:
+        """Mette in coda una riesecuzione. None se ce n'e' gia' una in attesa per la stessa caccia."""
+        if self.conn.execute("SELECT 1 FROM run_requests WHERE hunt=? AND claimed_at IS NULL", (hunt,)).fetchone():
+            return None
+        cur = self.conn.execute(
+            "INSERT INTO run_requests (hunt, requested_at, rigenera_piano, fonti) VALUES (?,?,?,?)",
+            (hunt, now(), int(rigenera_piano), ",".join(fonti) if fonti else None))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending_requests(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM run_requests WHERE claimed_at IS NULL ORDER BY id").fetchall()
+
+    def claim_request(self, req_id: int) -> bool:
+        """Prende in carico la richiesta; False se un altro processo l'ha gia' presa."""
+        cur = self.conn.execute("UPDATE run_requests SET claimed_at=? WHERE id=? AND claimed_at IS NULL",
+                                (now(), req_id))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def finish_request(self, req_id: int, error: str | None = None) -> None:
+        self.conn.execute("UPDATE run_requests SET finished_at=?, error=? WHERE id=?", (now(), error, req_id))
+        self.conn.commit()
+
+    def request_state(self, hunt: str) -> dict | None:
+        """Ultima richiesta della caccia, per mostrarne lo stato nell'interfaccia."""
+        r = self.conn.execute("SELECT * FROM run_requests WHERE hunt=? ORDER BY id DESC LIMIT 1",
+                              (hunt,)).fetchone()
+        return dict(r) if r else None
 
     def ebay_calls_today(self) -> int:
         """Chiamate eBay dal giorno corrente (UTC), sommando le statistiche delle esecuzioni."""
@@ -136,11 +196,12 @@ class DB:
         if existing is None:
             self.conn.execute(
                 """INSERT INTO items (hunt, legacy_id, item_id, marketplace, title, url, price, shipping,
-                   total, currency, condition, country, seller, is_auction, end_date, first_seen, last_seen, image)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   total, currency, condition, country, seller, is_auction, end_date, first_seen, last_seen, image,
+                   source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (hunt, l.legacy_id, l.item_id, l.marketplace, l.title, l.url, l.price, l.shipping,
                  l.total, l.currency, l.condition, l.country, l.seller, int(l.is_auction), l.end_date, t, t,
-                 l.image))
+                 l.image, l.source))
         else:
             self.conn.execute(
                 """UPDATE items SET title=?, url=?, price=?, shipping=?, total=?, last_seen=?, end_date=?,
