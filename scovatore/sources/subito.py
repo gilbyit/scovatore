@@ -101,7 +101,13 @@ class SubitoSource(WebSource):
             params = {"q": query, "order": p.ordinamento}
             if page > 1:
                 params["o"] = str(page)
-            r = self._get(url, params=params, accept="text/html,application/xhtml+xml")
+            try:
+                r = self._get(url, params=params, accept="text/html,application/xhtml+xml")
+            except SourceError as exc:
+                if exc.blocked:
+                    raise SourceError(f"{exc} Subito rifiuta spesso i client automatici: se succede sempre, togli "
+                                      f"'subito' dal campo `fonti` della caccia.", blocked=True) from exc
+                raise
             if r.status_code == 404:
                 raise SourceError(f"Subito: pagina non trovata, controlla regione '{scope}' e categoria "
                                   f"'{p.categoria}'")

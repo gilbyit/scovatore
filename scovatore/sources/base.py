@@ -51,14 +51,18 @@ class WebSource:
             time.sleep(wait)
 
     def _get(self, url: str, params: dict | None = None, headers: dict | None = None,
-             accept: str = "application/json") -> httpx.Response:
-        """GET con pausa, un paio di tentativi sugli errori passeggeri e blocchi riconosciuti."""
+             accept: str = "application/json", method: str = "GET",
+             raise_on_block: bool = True) -> httpx.Response:
+        """GET con pausa, un paio di tentativi sugli errori passeggeri e blocchi riconosciuti.
+
+        Con `raise_on_block=False` un 403/429 si restituisce al chiamante (serve a Vinted, dove un 403
+        senza token significa solo "sessione da rinnovare")."""
         hdrs = {"Accept": accept, **(headers or {})}
         for attempt in range(3):
             self._pace()
             self.calls += 1
             try:
-                r = self.http.get(url, params=params, headers=hdrs)
+                r = self.http.request(method, url, params=params, headers=hdrs)
             except httpx.HTTPError as exc:
                 self._last = time.monotonic()
                 if attempt < 2:
@@ -67,8 +71,9 @@ class WebSource:
                     continue
                 raise SourceError(f"{self.label}: rete non raggiungibile ({exc})") from exc
             self._last = time.monotonic()
-            log.debug("%s GET %s -> %d (richiesta %d)", self.label, url.split("?")[0][-70:], r.status_code, self.calls)
-            if r.status_code in (403, 429):
+            log.debug("%s %s %s -> %d (richiesta %d)", self.label, method, url.split("?")[0][-70:], r.status_code,
+                      self.calls)
+            if r.status_code in (403, 429) and raise_on_block:
                 raise SourceError(f"{self.label}: richiesta rifiutata ({r.status_code}), probabile protezione "
                                   f"anti-bot o troppe richieste", blocked=True)
             if r.status_code >= 500 and attempt < 2:
