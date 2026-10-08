@@ -19,7 +19,8 @@ services:
   # Interfaccia web sui risultati, con interventi manuali: http://<nasgul>:8482
   # data/ deve restare scrivibile: elimina, correzioni e richieste "Riesegui ora" finiscono nel DB
   # (le richieste le esegue il servizio scovatore qui sopra, che controlla il DB ogni 10 secondi).
-  # cacce/ in sola lettura serve a mostrare anche le cacce che non hanno ancora girato e le loro fonti.
+  # cacce/ e' montata in scrittura: l'editor web salva qui i file YAML (con la copia precedente in cacce/.storico/)
+  # e serve il SCOVATORE_WEB_TOKEN. Il servizio scovatore le legge soltanto.
   scovatore-web:
     build: .
     container_name: scovatore-web
@@ -33,7 +34,7 @@ services:
     ports:
       - "${SCOVATORE_WEB_PORT:-8482}:8482"
     volumes:
-      - ./cacce:/app/cacce:ro
+      - ./cacce:/app/cacce
       - ./data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8482/salute')"]

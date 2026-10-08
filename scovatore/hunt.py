@@ -201,7 +201,7 @@ class Hunt:
         return p.read_text(encoding="utf-8")
 
 
-def _slug(s: str) -> str:
+def slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
@@ -348,10 +348,10 @@ def _subito(data: dict) -> SubitoParams:
     s = _section(data, "subito", SubitoParams)
     for key in ("regione", "categoria"):
         if key in s:
-            slug = _slug(str(s[key]))
-            if not slug:
+            value = slug(str(s[key]))
+            if not value:
                 raise HuntError(f"subito.{key} non valido: {s[key]!r}")
-            s[key] = slug
+            s[key] = value
     sp = SubitoParams(**s)
     if sp.ordinamento not in SUBITO_ORDER:
         raise HuntError(f"subito.ordinamento non valido: {sp.ordinamento} (validi: {sorted(SUBITO_ORDER)})")
@@ -411,7 +411,7 @@ def parse_hunt(data: dict, path: Path | None = None) -> Hunt:
     if "lingue" in fields:
         fields["lingue"] = _languages(fields["lingue"])
     fields["fonti"] = _sources(data.get("fonti"))
-    fields["nome"] = _slug(str(data.get("nome") or (path.stem if path else "caccia")))
+    fields["nome"] = slug(str(data.get("nome") or (path.stem if path else "caccia")))
     return Hunt(ebay=ep, vinted=_vinted(data), subito=_subito(data), path=path, **fields)
 
 

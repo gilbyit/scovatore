@@ -159,12 +159,16 @@ def test_hunt_validation():
 
 
 def test_example_hunts_are_valid():
+    """Nel repository c'e' solo il modello; le cacce vere sono locali (gitignore) e, se ci sono, devono caricarsi."""
     hunts = load_all(ROOT / "cacce")
     files = sorted((ROOT / "cacce").glob("*.y*ml"))
-    assert len(hunts) == len(files), "una caccia di esempio non si carica"   # load_all salta le invalide
-    assert {"mobo-ddr3-quad", "ampli-guasto"} <= {h.nome for h in hunts}
-    amp = next(h for h in hunts if h.nome == "ampli-guasto")
-    assert amp.ebay.condizioni == [7000] and amp.ebay.spedizione_max == 15
+    assert len(hunts) == len(files), "una caccia non si carica"            # load_all salta le invalide
+    assert "esempio-fonti" in {h.nome for h in hunts}
+
+
+def test_spedizione_max_nel_file_della_caccia():
+    h = parse_hunt({"nome": "x", "ricerca": "y", "ebay": {"condizioni": ["guasto"], "spedizione_max": 15}})
+    assert h.ebay.condizioni == [7000] and h.ebay.spedizione_max == 15
 
 
 def test_extract_json_variants():

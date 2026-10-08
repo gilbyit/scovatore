@@ -85,7 +85,7 @@ docker compose up -d --build
 docker logs -f scovatore
 ```
 
-Il container gira in `loop`: ogni 10 minuti controlla quali cacce sono scadute (campo `ogni_minuti`) e le esegue; ogni 10 secondi controlla anche le richieste "Riesegui ora" arrivate dall'interfaccia web. Cacce e dati di riferimento sono montati in sola lettura (anche nel servizio web, che li legge per mostrare le fonti di ogni caccia): per aggiungere o modificare una caccia basta toccare il file YAML, senza riavviare.
+Il container gira in `loop`: ogni 10 minuti controlla quali cacce sono scadute (campo `ogni_minuti`) e le esegue; ogni 10 secondi controlla anche le richieste "Riesegui ora" arrivate dall'interfaccia web. Per aggiungere o modificare una caccia basta toccare il file YAML (o usare l'editor dell'interfaccia web), senza riavviare. Il servizio `scovatore` monta `cacce/` e `dati/` in sola lettura; il servizio web monta `cacce/` in scrittura, perché è lui che salva le modifiche dell'editor.
 
 Comandi a mano dentro il container:
 
@@ -118,6 +118,9 @@ python -m scovatore risultati ampli-guasto --tutti    # anche i non verificati
 Il compose avvia anche `scovatore-web`, che lavora sullo stesso database del servizio:
 
 - `http://nasgul:8482/`: riepilogo delle cacce (conformi, verificati, in attesa, ultimo giro ed eventuali errori);
+- **editor delle cacce** (scheda in home o pagina della caccia, link **Modifica**): mostra e modifica il file YAML della caccia come testo, con un riepilogo (stato, fonti, prezzo, lingue). Al salvataggio il file viene controllato con la stessa validazione del caricamento: se c'è un errore (YAML rotto, campo sconosciuto, valore non valido) non salva e mostra il motivo, con il testo che hai scritto ancora nell'editor. La versione precedente finisce in `cacce/.storico/` (ultime 20 per caccia) e dalla pagina si può ricaricare nell'editor. Il nome della caccia non si cambia (dati e giri sono legati al nome), e se il file è cambiato nel frattempo (altra modifica, `git pull`) il salvataggio viene rifiutato invece di sovrascriverla. `dati_riferimento` può puntare solo dentro `dati/`. Una modifica vale dal giro successivo. **Serve `SCOVATORE_WEB_TOKEN`**: senza token le pagine si vedono ma non si salva;
+- **nuova caccia** (pulsante in home): parte da `cacce/esempio-fonti.yaml`, spenta; il nome del file si ricava dal campo `nome`;
+- **Accendi / Spegni** (sulla scheda in home): cambia solo la riga `attiva:` del file, lasciando commenti e resto intatti;
 - **cacce spente ed eliminate**: la home le mostra in sezioni separate, con un'etichetta e un colore (ambra le spente, rosso le eliminate), e ognuna ha il pulsante **Elimina dati...**. *Spenta* = nel file YAML c'è `attiva: false` (si può ancora rieseguire a mano). *Eliminata* = il file YAML non c'è più ma nel database restano i dati (non si può rieseguire). Un file YAML illegibile o la cartella `cacce/` non montata non vengono mai scambiati per una caccia eliminata;
 - **Elimina i dati dal database** (pulsante sulla scheda in home, o link nella pagina della caccia): apre una pagina di conferma che mostra quanti annunci, giri e piani verrebbero cancellati e chiede di scrivere il nome della caccia. Cancella solo il database, **mai il file YAML**: una caccia spenta resta definita e, riaccesa, riparte da zero. Una caccia attiva non si può eliminare, né se ha una richiesta in coda o un giro in corso. I giri di oggi restano, perché da quelli si calcola il tetto giornaliero di chiamate eBay. Gli annunci corretti a mano si perdono insieme agli altri;
 - `/caccia/<nome>`: classifica filtrabile per esito, punteggio minimo, fonte, paese, periodo, con ordinamento per punteggio, prezzo o novità. Ogni annuncio ha il dettaglio della verifica (requisiti, fonte del dato, rischi, domande al venditore) e il motivo della scrematura;
@@ -148,7 +151,7 @@ Qualunque sia il modello, le query fatte solo di parole di stato o generiche ("n
 
 ## Definire una caccia
 
-Un file YAML in `cacce/`. Esempi completi in `cacce/mobo-ddr3-quad.yaml` e `cacce/ampli-guasto.yaml`.
+Un file YAML in `cacce/`. Nel repository c'è solo il modello `cacce/esempio-fonti.yaml`: le cacce vere sono configurazione personale, restano sul server e sono ignorate da git (`.gitignore`). Si creano e si modificano dall'interfaccia web o a mano.
 
 ```yaml
 nome: ampli-guasto
@@ -328,6 +331,7 @@ Sono la parte fragile di Scovatore. Leggi prima di affidarti ai risultati.
 scovatore/
   config.py     configurazione da .env
   hunt.py       schema e validazione delle cacce YAML
+  huntfiles.py  modifica sicura dei file YAML: validazione, storico, nuova caccia, attiva/spegni
   ebay.py       client Browse API (OAuth, search, getItem, filtri)
   sources/      fonti web senza API: base.py (pausa, blocchi, URL sicuri), vinted.py, subito.py
   llm.py        client OpenAI-compatible con limitatore di token ed estrazione JSON robusta
@@ -337,7 +341,7 @@ scovatore/
   notify.py     ntfy
   web.py        interfaccia web con interventi manuali (solo libreria standard)
   cli.py        comandi
-cacce/          definizioni delle cacce
+cacce/          definizioni delle cacce (solo il modello e' nel repository; .storico/ = copie dell'editor)
 dati/           dati di riferimento per Groq
 data/           database (creato al primo avvio, non versionato)
 tests/          test con eBay e LLM finti (httpx.MockTransport)
@@ -350,7 +354,7 @@ pip install pytest
 python -m pytest -q
 ```
 
-I test non chiamano servizi esterni: eBay, Vinted, Subito.it, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, alias `ue` e filtro paesi, tetto di ricerche, migrazione del DB, pagine e token dell'interfaccia web, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay, parsing e isolamento dei guasti delle fonti web, coda delle riesecuzioni dal web.
+I test non chiamano servizi esterni: eBay, Vinted, Subito.it, Palantir, Groq e ntfy sono simulati. Coprono filtri, validazione delle cacce, alias `ue` e filtro paesi, tetto di ricerche, migrazione del DB, pagine e token dell'interfaccia web, parsing JSON sporco, filtri locali, pipeline completa con cache di piano, scrematura e verifica, fallback senza `response_format`, notifiche e budget giornaliero eBay, parsing e isolamento dei guasti delle fonti web, coda delle riesecuzioni dal web, editor dei file di caccia (validazione, storico, conflitti, percorsi ostili, token).
 
 ## Integrazione con GILPA (prossimo passo)
 
