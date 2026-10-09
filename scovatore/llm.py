@@ -49,6 +49,17 @@ def extract_json(text: str):
     raise LLMError(f"nessun JSON valido nella risposta: {text[:200]!r}")
 
 
+def failed_generation(text: str) -> tuple[bool, str]:
+    """(e' un json_validate_failed di Groq?, testo che il modello aveva generato)."""
+    try:
+        err = (json.loads(text) or {}).get("error") or {}
+    except (ValueError, AttributeError):
+        return False, ""
+    if not isinstance(err, dict) or err.get("code") != "json_validate_failed":
+        return False, ""
+    return True, str(err.get("failed_generation") or "")
+
+
 class TokenBucket:
     """Limitatore a finestra mobile di 60 s sui token stimati."""
 
@@ -103,8 +114,9 @@ class LLMClient:
 
         est = estimate_tokens(system + user) + body["max_tokens"]
         last_err = ""
+        call_no_json = False        # solo per questa chiamata: dopo due JSON rifiutati si prova senza response_format
         for attempt in range(4):
-            if self._json_mode:
+            if self._json_mode and not call_no_json:
                 body["response_format"] = {"type": "json_object"}
             else:
                 body.pop("response_format", None)
@@ -126,6 +138,25 @@ class LLMClient:
                 wait = float(r.headers.get("retry-after") or 20)
                 log.warning("%s: 429, attendo %.0f s", self.cfg.name, wait)
                 time.sleep(min(wait, 120))
+                continue
+            bad_json, generated = failed_generation(r.text) if r.status_code == 400 else (False, "")
+            if bad_json:
+                # Groq ha rifiutato un JSON del modello. Spesso e' cosi' lungo da essere stato troncato da max_tokens
+                # (nei modelli che ragionano i token di ragionamento contano): se il testo e' comunque leggibile
+                # lo si recupera, altrimenti si riprova con piu' spazio e, dalla seconda volta, senza json mode.
+                try:
+                    obj = extract_json(generated)
+                    log.info("%s: JSON rifiutato da Groq ma leggibile, lo recupero", self.cfg.name)
+                    return obj
+                except LLMError:
+                    pass
+                last_err = f"{r.status_code} json_validate_failed (risposta probabilmente troncata)"
+                body["max_tokens"] = min(int(body["max_tokens"] * 1.6) + 200, 6000)
+                est = estimate_tokens(system + user) + body["max_tokens"]
+                call_no_json = call_no_json or attempt >= 1
+                log.warning("%s: JSON non valido (%s), riprovo con max_tokens %d%s", self.cfg.name,
+                            generated[-60:].replace("\n", " ") or "?", body["max_tokens"],
+                            " senza json mode" if call_no_json else "")
                 continue
             if r.status_code == 400 and self._json_mode and "response_format" in r.text:
                 log.warning("%s: response_format non supportato, lo disattivo", self.cfg.name)
