@@ -74,6 +74,8 @@ Se il gateway non accetta `response_format`, Scovatore se ne accorge al primo 40
 
 Metti la chiave in `GROQ_API_KEY`. Default: `openai/gpt-oss-120b` con `reasoning_effort=low`. Il limitatore interno rispetta `GROQ_TPM_LIMIT` (8000 token al minuto sul piano gratuito) e in caso di 429 aspetta quanto indicato da `retry-after`.
 
+Se Groq rifiuta una risposta con `json_validate_failed` (di solito il JSON è stato troncato da `GROQ_MAX_TOKENS`, perché nei modelli che ragionano contano anche i token di ragionamento), il client recupera il testo se è leggibile; altrimenti riprova con più spazio e, dalla seconda volta, senza `response_format`. Se capita spesso alza `GROQ_MAX_TOKENS`.
+
 Senza chiave Groq la pipeline si ferma alla scrematura: gli annunci restano visibili con `risultati --tutti`.
 
 ## Uso

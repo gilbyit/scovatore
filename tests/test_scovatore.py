@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -265,6 +266,52 @@ def test_llm_falls_back_when_json_mode_rejected(env):
     c = LLMClient(env.palantir, transport=httpx.MockTransport(handler))
     assert c.chat_json("s", "u") == {"ok": True}
     assert seen == [True, False]
+
+
+def _groq_json_error(generated):
+    return httpx.Response(400, json={"error": {
+        "message": "Failed to generate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
+        "type": "invalid_request_error", "code": "json_validate_failed", "failed_generation": generated}})
+
+
+def test_llm_recupera_il_json_rifiutato_da_groq_se_e_leggibile(env):
+    # il caso reale: virgolette di pollici dentro una stringa; Groq rifiuta, il testo e' leggibile
+    generated = 'Ecco: {"oggetto": "HGST 4 TB SAS 3,5\\" (HUS726040AL5214)", "esito": "incerto"} fine'
+    calls = []
+
+    def handler(req):
+        calls.append(json.loads(req.content))
+        return _groq_json_error(generated)
+
+    c = LLMClient(env.palantir, transport=httpx.MockTransport(handler))
+    assert c.chat_json("s", "u") == {"oggetto": 'HGST 4 TB SAS 3,5" (HUS726040AL5214)', "esito": "incerto"}
+    assert len(calls) == 1
+
+
+def test_llm_json_troncato_riprova_con_piu_token_e_poi_senza_json_mode(env):
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        seen.append((body["max_tokens"], "response_format" in body))
+        if len(seen) < 3:
+            return _groq_json_error('{"oggetto": "HGST 4 TB", "requisiti": [{"requisito": "SATA", "stato": "o')
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+    cfg = replace(env.palantir, max_tokens=1500) if hasattr(env.palantir, "__dataclass_fields__") else env.palantir
+    c = LLMClient(cfg, transport=httpx.MockTransport(handler))
+    assert c.chat_json("s", "u") == {"ok": True}
+    assert len(seen) == 3
+    assert seen[1][0] > seen[0][0] and seen[2][0] > seen[1][0]       # ogni tentativo ha piu' spazio
+    assert [j for _, j in seen] == [True, True, False]               # dalla seconda volta senza json mode
+    assert c._json_mode is True                                       # ma solo per questa chiamata
+
+
+def test_llm_json_sempre_invalido_esaurisce_i_tentativi(env):
+    c = LLMClient(env.palantir, transport=httpx.MockTransport(
+        lambda r: _groq_json_error('{"a": "troncato')))
+    with pytest.raises(Exception, match="tentativi esauriti"):
+        c.chat_json("s", "u")
 
 
 def test_notify(env, monkeypatch):
